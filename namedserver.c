@@ -441,6 +441,7 @@ static void handle_remaccess(int cfd, const char *fname, const char *user){
 }
 
 static void handle_delete(int cfd, const char *client, const char *fname){
+    // printf("Going to delete\n");
     pthread_mutex_lock(&g_mtx);
     int i = fv_find(&ALL_FILES, fname);
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
@@ -451,11 +452,12 @@ static void handle_delete(int cfd, const char *client, const char *fname){
         return;
     }
     fv_remove_at(&ALL_FILES, i);
-    ss_decrease_load(m.ss_id);
     pthread_mutex_unlock(&g_mtx);
 
-    send_line(cfd, "OK DELETED %s", fname);
+    ss_decrease_load(m.ss_id);
 
+    send_line(cfd, "OK DELETED %s", fname);
+    
     // notify SS
     char payload[LINE_MAX]; snprintf(payload,sizeof(payload),"DELETE %s", fname);
     send_one_line_to_ss(m.ss_id, client, payload, cfd);

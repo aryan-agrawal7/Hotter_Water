@@ -21,7 +21,6 @@
 #define NM_IP   "127.0.0.1"
 #define NM_PORT 5000
 #define ID_MAX  64
-#define LINE_MAX 2048
 
 static char g_storage_dir[PATH_MAX];
 

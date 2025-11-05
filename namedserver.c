@@ -9,6 +9,7 @@
 //   where <payload> is one of:
 //     VIEW | VIEW -a | VIEW -l | VIEW -al
 //     CREATE <filename>
+//     READ <filename>
 //     WRITE <filename> <sentence_number>   (followed by many lines, ends with ETIRW)
 //     UNDO <filename>
 //     DELETE <filename>
@@ -36,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -51,6 +53,10 @@
 #define IP_MAX  INET_ADDRSTRLEN
 #define FNAME_MAX 256
 #define LINE_MAX 4096
+
+#define FILE_INITIAL_CAPACITY 256
+#define FILE_MAP_INIT_CAP (FILE_INITIAL_CAPACITY*2)
+#define FILE_CACHE_SIZE 64
 
 // ----------------------- string list -----------------------
 typedef struct {
@@ -92,20 +98,246 @@ static void fv_free(FileVec *fv){
     for(int i=0;i<fv->n;i++){ sl_free(&fv->v[i].rd); sl_free(&fv->v[i].wr); sl_free(&fv->v[i].ex); }
     free(fv->v); fv->v=NULL; fv->n=fv->cap=0;
 }
-static void fv_reserve(FileVec *fv, int need){ if(need<=fv->cap) return; int nc=fv->cap? fv->cap*2:16; if(nc<need) nc=need; fv->v=realloc(fv->v, nc*sizeof(FILE_META_DATA)); fv->cap=nc; }
+static void fv_reserve(FileVec *fv, int need){
+    if(need<=fv->cap) return;
+    int nc = fv->cap ? fv->cap*2 : FILE_INITIAL_CAPACITY;
+    if(nc<need) nc=need;
+    fv->v=realloc(fv->v, nc*sizeof(FILE_META_DATA));
+    fv->cap=nc;
+}
 static FILE_META_DATA* fv_add(FileVec *fv){
     fv_reserve(fv, fv->n+1); FILE_META_DATA *m=&fv->v[fv->n++]; memset(m,0,sizeof(*m));
     sl_init(&m->rd); sl_init(&m->wr); sl_init(&m->ex); return m;
 }
-static int fv_find(FileVec *fv, const char *fname){
-    for(int i=0;i<fv->n;i++) if(strcmp(fv->v[i].filename,fname)==0) return i;
+typedef struct {
+    char *key;
+    int index;
+    unsigned char state; // 0=empty,1=used,2=tombstone
+} FileHashEntry;
+
+typedef struct {
+    FileHashEntry *entries;
+    int capacity;
+    int size;
+} FileHashMap;
+
+typedef struct {
+    char filename[FNAME_MAX];
+    int index;
+    unsigned int age;
+    bool valid;
+} FileCacheEntry;
+
+typedef struct {
+    FileCacheEntry entries[FILE_CACHE_SIZE];
+    unsigned int tick;
+} FileCache;
+
+static FileHashMap FILE_MAP;
+static FileCache FILE_CACHE;
+static int g_file_cap = FILE_INITIAL_CAPACITY;
+
+static uint64_t hash_string(const char *s){
+    uint64_t h = 1469598103934665603ULL; // FNV-1a
+    while(*s){
+        h ^= (unsigned char)(*s++);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void file_map_init(FileHashMap *map){
+    map->capacity = FILE_MAP_INIT_CAP;
+    map->size = 0;
+    map->entries = calloc(map->capacity, sizeof(FileHashEntry));
+}
+
+static void file_cache_init(FileCache *cache){ memset(cache, 0, sizeof(*cache)); }
+
+static int file_map_probe(FileHashMap *map, const char *key, bool *found){
+    if(map->capacity == 0){ *found = false; return -1; }
+    uint64_t base = hash_string(key);
+    int first_tomb = -1;
+    for(int i=0;i<map->capacity;i++){
+        int idx = (int)((base + (uint64_t)i) % (uint64_t)map->capacity);
+        FileHashEntry *e = &map->entries[idx];
+        if(e->state == 0){
+            *found = false;
+            return (first_tomb>=0)? first_tomb : idx;
+        }
+        if(e->state == 1 && strcmp(e->key, key)==0){
+            *found = true;
+            return idx;
+        }
+        if(e->state == 2 && first_tomb < 0) first_tomb = idx;
+    }
+    *found = false;
+    return (first_tomb>=0)? first_tomb : -1;
+}
+
+static void file_map_put_entry(FileHashMap *map, char *key, int index){
+    bool found=false;
+    int slot = file_map_probe(map, key, &found);
+    if(slot<0) return;
+    if(found){
+        map->entries[slot].index = index;
+        return;
+    }
+    map->entries[slot].key = key;
+    map->entries[slot].index = index;
+    map->entries[slot].state = 1;
+    map->size++;
+}
+
+static void file_map_rehash(FileHashMap *map, int new_cap){
+    FileHashEntry *old_entries = map->entries;
+    int old_cap = map->capacity;
+    map->entries = calloc(new_cap, sizeof(FileHashEntry));
+    map->capacity = new_cap;
+    map->size = 0;
+    for(int i=0;i<old_cap;i++){
+        if(old_entries[i].state == 1){
+            file_map_put_entry(map, old_entries[i].key, old_entries[i].index);
+        }
+    }
+    free(old_entries);
+}
+
+static void file_map_set(FileHashMap *map, const char *key, int index){
+    if(map->capacity == 0) file_map_init(map);
+    if((map->size + 1) * 100 / map->capacity > 70){
+        file_map_rehash(map, map->capacity * 2);
+    }
+    bool found=false;
+    int slot = file_map_probe(map, key, &found);
+    if(slot<0) return;
+    if(found){
+        map->entries[slot].index = index;
+        return;
+    }
+    map->entries[slot].key = strdup(key);
+    map->entries[slot].index = index;
+    map->entries[slot].state = 1;
+    map->size++;
+}
+
+static int file_map_get(FileHashMap *map, const char *key){
+    if(map->capacity == 0) return -1;
+    bool found=false;
+    int slot = file_map_probe(map, key, &found);
+    if(found && slot>=0) return map->entries[slot].index;
     return -1;
 }
+
+static void file_map_update(FileHashMap *map, const char *key, int index){
+    if(map->capacity == 0) return;
+    bool found=false;
+    int slot = file_map_probe(map, key, &found);
+    if(found && slot>=0) map->entries[slot].index = index;
+}
+
+static void file_map_remove(FileHashMap *map, const char *key){
+    if(map->capacity == 0) return;
+    bool found=false;
+    int slot = file_map_probe(map, key, &found);
+    if(!found || slot<0) return;
+    free(map->entries[slot].key);
+    map->entries[slot].key = NULL;
+    map->entries[slot].index = -1;
+    map->entries[slot].state = 2;
+    if(map->size>0) map->size--;
+}
+
+static void file_map_free(FileHashMap *map){
+    if(!map->entries) return;
+    for(int i=0;i<map->capacity;i++) if(map->entries[i].state == 1) free(map->entries[i].key);
+    free(map->entries);
+    map->entries=NULL;
+    map->capacity=0;
+    map->size=0;
+}
+
+static bool file_cache_lookup(FileCache *cache, const char *fname, int *out_index){
+    for(int i=0;i<FILE_CACHE_SIZE;i++){
+        FileCacheEntry *e=&cache->entries[i];
+        if(e->valid && strcmp(e->filename,fname)==0){
+            e->age = ++cache->tick;
+            *out_index = e->index;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void file_cache_insert(FileCache *cache, const char *fname, int index){
+    FileCacheEntry *slot=NULL;
+    FileCacheEntry *oldest=NULL;
+    for(int i=0;i<FILE_CACHE_SIZE;i++){
+        FileCacheEntry *e=&cache->entries[i];
+        if(!e->valid){ slot=e; break; }
+        if(!oldest || e->age < oldest->age) oldest = e;
+    }
+    if(!slot) slot = oldest;
+    slot->valid = true;
+    slot->index = index;
+    slot->age = ++cache->tick;
+    strncpy(slot->filename, fname, FNAME_MAX-1);
+    slot->filename[FNAME_MAX-1]='\0';
+}
+
+static void file_cache_invalidate(FileCache *cache, const char *fname){
+    for(int i=0;i<FILE_CACHE_SIZE;i++){
+        FileCacheEntry *e=&cache->entries[i];
+        if(e->valid && strcmp(e->filename,fname)==0){
+            e->valid=false;
+            return;
+        }
+    }
+}
+
+static void file_cache_update(FileCache *cache, const char *fname, int index){
+    for(int i=0;i<FILE_CACHE_SIZE;i++){
+        FileCacheEntry *e=&cache->entries[i];
+        if(e->valid && strcmp(e->filename,fname)==0){
+            e->index = index;
+            e->age = ++cache->tick;
+            return;
+        }
+    }
+}
+
+static int fv_find(FileVec *fv, const char *fname){
+    int idx=-1;
+    if(file_cache_lookup(&FILE_CACHE, fname, &idx)){
+        if(idx>=0 && idx<fv->n && strcmp(fv->v[idx].filename,fname)==0) return idx;
+        file_cache_invalidate(&FILE_CACHE, fname);
+    }
+    idx = file_map_get(&FILE_MAP, fname);
+    if(idx>=0 && idx<fv->n && strcmp(fv->v[idx].filename,fname)==0){
+        file_cache_insert(&FILE_CACHE, fname, idx);
+        return idx;
+    }
+    if(idx>=0) file_map_remove(&FILE_MAP, fname);
+    return -1;
+}
+
 static void fv_remove_at(FileVec *fv, int idx){
-    FILE_META_DATA *m=&fv->v[idx];
-    sl_free(&m->rd); sl_free(&m->wr); sl_free(&m->ex);
-    for(int j=idx+1;j<fv->n;j++) fv->v[j-1]=fv->v[j];
+    if(idx<0 || idx>=fv->n) return;
+    FILE_META_DATA removed = fv->v[idx];
+    file_cache_invalidate(&FILE_CACHE, removed.filename);
+    file_map_remove(&FILE_MAP, removed.filename);
+
+    int last = fv->n - 1;
+    if(idx != last){
+        FILE_META_DATA moved = fv->v[last];
+        fv->v[idx] = moved;
+        file_map_update(&FILE_MAP, fv->v[idx].filename, idx);
+        file_cache_update(&FILE_CACHE, fv->v[idx].filename, idx);
+    }
     fv->n--;
+    sl_free(&removed.rd);
+    sl_free(&removed.wr);
+    sl_free(&removed.ex);
 }
 
 // ----------------------- storage server registry + heap -----------------------
@@ -176,6 +408,18 @@ static int heap_top(){
 // ----------------------- global metadata -----------------------
 static FileVec ALL_FILES;
 static StrList USER_LIST;
+
+// Ensure metadata storage grows geometrically as the file count rises.
+static void ensure_file_capacity(void){
+    if(ALL_FILES.n < g_file_cap) return;
+    int new_cap = g_file_cap * 2;
+    fv_reserve(&ALL_FILES, new_cap);
+    if(FILE_MAP.capacity == 0) file_map_init(&FILE_MAP);
+    if(FILE_MAP.capacity < new_cap * 2){
+        file_map_rehash(&FILE_MAP, new_cap * 2);
+    }
+    g_file_cap = new_cap;
+}
 
 // ----------------------- socket helpers -----------------------
 static int create_listen_socket(int port) {
@@ -393,7 +637,8 @@ static void handle_create(int cfd, const char *client, const char *fname){
         send_line(cfd, "ERROR NO_STORAGE_SERVERS");
         return;
     }
-    // Create metadata
+    // Grow metadata tables if needed, then create entry
+    ensure_file_capacity();
     FILE_META_DATA *m = fv_add(&ALL_FILES);
     strncpy(m->filename, fname, FNAME_MAX-1);
     strncpy(m->ss_id,    g_ss[sidx].id, ID_MAX-1);
@@ -401,6 +646,9 @@ static void handle_create(int cfd, const char *client, const char *fname){
     sl_add_unique(&m->rd, client);
     sl_add_unique(&m->wr, client);
     sl_add_unique(&m->ex, client);
+    int new_index = ALL_FILES.n - 1;
+    file_map_set(&FILE_MAP, m->filename, new_index);
+    file_cache_insert(&FILE_CACHE, m->filename, new_index);
     // Update heap load
     g_ss[sidx].file_count++;
     heap_update(sidx);
@@ -732,6 +980,8 @@ static void *worker(void *arg_) {
 int main(void) {
     fv_init(&ALL_FILES);
     sl_init(&USER_LIST);
+    file_map_init(&FILE_MAP);
+    file_cache_init(&FILE_CACHE);
 
     int listen_fd = create_listen_socket(NM_PORT);
     printf("[NM] listening on port %d\n", NM_PORT); fflush(stdout);
@@ -750,5 +1000,6 @@ int main(void) {
 
     // (not reached)
     fv_free(&ALL_FILES); sl_free(&USER_LIST);
+    file_map_free(&FILE_MAP);
     return 0;
 }

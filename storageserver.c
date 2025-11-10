@@ -24,6 +24,12 @@
 
 static char g_storage_dir[PATH_MAX];
 
+static int storage_dir_for(const char *name, char *out, size_t out_sz);
+static int ensure_file_container(const char *name);
+static int storage_path_for(const char *name, char *out, size_t out_sz);
+static int undo_path_for(const char *name, char *out, size_t out_sz);
+static int swap_path_for(const char *name, char *out, size_t out_sz);
+
 static int create_listen_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket"); exit(1); }
@@ -89,23 +95,6 @@ static bool is_valid_name_component(const char *name) {
     return true;
 }
 
-static int storage_path_for(const char *name, char *out, size_t out_sz) {
-    if (!is_valid_name_component(name)) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (g_storage_dir[0] == '\0') {
-        errno = ENODEV;
-        return -1;
-    }
-    int written = snprintf(out, out_sz, "%s/%s", g_storage_dir, name);
-    if (written < 0 || (size_t)written >= out_sz) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    return 0;
-}
-
 static int ensure_storage_directory(const char *ss_id) {
     if (!is_valid_name_component(ss_id)) {
         errno = EINVAL;
@@ -136,6 +125,9 @@ static int ensure_storage_directory(const char *ss_id) {
 }
 
 static int create_storage_file(const char *filename) {
+    if (ensure_file_container(filename) < 0) {
+        return -1;
+    }
     char path[PATH_MAX];
     if (storage_path_for(filename, path, sizeof(path)) < 0) {
         return -1;
@@ -145,6 +137,11 @@ static int create_storage_file(const char *filename) {
         return -1;
     }
     close(fd);
+
+    char undo_path[PATH_MAX];
+    if (undo_path_for(filename, undo_path, sizeof(undo_path)) == 0) {
+        unlink(undo_path);
+    }
     return 0;
 }
 
@@ -153,7 +150,24 @@ static int delete_storage_file(const char *filename) {
     if (storage_path_for(filename, path, sizeof(path)) < 0) {
         return -1;
     }
-    return unlink(path);
+    if (unlink(path) < 0) {
+        return -1;
+    }
+
+    char undo_path[PATH_MAX];
+    if (undo_path_for(filename, undo_path, sizeof(undo_path)) == 0) {
+        unlink(undo_path);
+    }
+    char swap_path[PATH_MAX];
+    if (swap_path_for(filename, swap_path, sizeof(swap_path)) == 0) {
+        unlink(swap_path);
+    }
+
+    char dir[PATH_MAX];
+    if (storage_dir_for(filename, dir, sizeof(dir)) == 0) {
+        rmdir(dir);
+    }
+    return 0;
 }
 
 static int open_storage_file_ro(const char *filename) {
@@ -177,6 +191,8 @@ static int send_all(int fd, const void *buf, size_t len) {
     }
     return 0;
 }
+
+static int write_all_fd(int fd, const char *buf, size_t len);
 
 typedef struct {
     char **data;
@@ -331,28 +347,27 @@ static int document_parse_from_path(const char *path, Document *doc, mode_t *mod
     if (mode_out) *mode_out = st.st_mode;
 
     size_t size = (size_t)st.st_size;
-    char *buffer = NULL;
-    if (size > 0) {
-        buffer = malloc(size + 1);
-        if (!buffer) {
+    char *buffer = malloc(size + 1);
+    if (!buffer) {
+        close(fd);
+        errno = ENOMEM;
+        return -1;
+    }
+
+    size_t off = 0;
+    while (off < size) {
+        ssize_t r = read(fd, buffer + off, size - off);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            free(buffer);
             close(fd);
-            errno = ENOMEM;
             return -1;
         }
-        size_t off = 0;
-        while (off < size) {
-            ssize_t r = read(fd, buffer + off, size - off);
-            if (r < 0) {
-                if (errno == EINTR) continue;
-                free(buffer);
-                close(fd);
-                return -1;
-            }
-            if (r == 0) break;
-            off += (size_t)r;
-        }
-        buffer[size] = '\0';
+        if (r == 0) break;
+        off += (size_t)r;
     }
+    size = off;
+    buffer[off] = '\0';
     close(fd);
 
     Sentence *current = NULL;
@@ -546,6 +561,179 @@ static int write_document_to_path(const Document *doc, const char *path, mode_t 
     return 0;
 }
 
+static int storage_dir_for(const char *name, char *out, size_t out_sz) {
+    if (!is_valid_name_component(name)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (g_storage_dir[0] == '\0') {
+        errno = ENODEV;
+        return -1;
+    }
+    int written = snprintf(out, out_sz, "%s/%s", g_storage_dir, name);
+    if (written < 0 || (size_t)written >= out_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int ensure_file_container(const char *name) {
+    char dir[PATH_MAX];
+    if (storage_dir_for(name, dir, sizeof(dir)) < 0) {
+        return -1;
+    }
+    struct stat st;
+    if (stat(dir, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            errno = ENOTDIR;
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT) {
+        return -1;
+    }
+    if (mkdir(dir, 0777) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int storage_path_for(const char *name, char *out, size_t out_sz) {
+    char dir[PATH_MAX];
+    if (storage_dir_for(name, dir, sizeof(dir)) < 0) {
+        return -1;
+    }
+    int written = snprintf(out, out_sz, "%s/%s", dir, name);
+    if (written < 0 || (size_t)written >= out_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int undo_path_for(const char *name, char *out, size_t out_sz) {
+    char dir[PATH_MAX];
+    if (storage_dir_for(name, dir, sizeof(dir)) < 0) {
+        return -1;
+    }
+    int written = snprintf(out, out_sz, "%s/.undo", dir);
+    if (written < 0 || (size_t)written >= out_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int swap_path_for(const char *name, char *out, size_t out_sz) {
+    char dir[PATH_MAX];
+    if (storage_dir_for(name, dir, sizeof(dir)) < 0) {
+        return -1;
+    }
+    int written = snprintf(out, out_sz, "%s/.swap", dir);
+    if (written < 0 || (size_t)written >= out_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int copy_file_to_path(const char *src_path, const char *dst_path) {
+    int src = open(src_path, O_RDONLY);
+    if (src < 0) {
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(src, &st) < 0) {
+        int saved = errno;
+        close(src);
+        errno = saved;
+        return -1;
+    }
+
+    char tmp_template[PATH_MAX];
+    int written = snprintf(tmp_template, sizeof(tmp_template), "%s.tmpXXXXXX", dst_path);
+    if (written < 0 || (size_t)written >= sizeof(tmp_template)) {
+        close(src);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    int dst = mkstemp(tmp_template);
+    if (dst < 0) {
+        int saved = errno;
+        close(src);
+        errno = saved;
+        return -1;
+    }
+
+    if (fchmod(dst, st.st_mode) < 0) {
+        int saved = errno;
+        close(dst);
+        unlink(tmp_template);
+        close(src);
+        errno = saved;
+        return -1;
+    }
+
+    char buffer[4096];
+    for (;;) {
+        ssize_t r = read(src, buffer, sizeof(buffer));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            int saved = errno;
+            close(dst);
+            unlink(tmp_template);
+            close(src);
+            errno = saved;
+            return -1;
+        }
+        if (r == 0) break;
+        if (write_all_fd(dst, buffer, (size_t)r) < 0) {
+            int saved = errno;
+            close(dst);
+            unlink(tmp_template);
+            close(src);
+            errno = saved;
+            return -1;
+        }
+    }
+
+    if (fsync(dst) < 0) {
+        int saved = errno;
+        close(dst);
+        unlink(tmp_template);
+        close(src);
+        errno = saved;
+        return -1;
+    }
+
+    if (close(dst) < 0) {
+        int saved = errno;
+        unlink(tmp_template);
+        close(src);
+        errno = saved;
+        return -1;
+    }
+    close(src);
+
+    if (unlink(dst_path) < 0 && errno != ENOENT) {
+        int saved = errno;
+        unlink(tmp_template);
+        errno = saved;
+        return -1;
+    }
+    if (rename(tmp_template, dst_path) < 0) {
+        int saved = errno;
+        unlink(tmp_template);
+        errno = saved;
+        return -1;
+    }
+    return 0;
+}
+
 static WriteSession g_write_sessions[32];
 
 static WriteSession *session_find_by_client(const char *client_id) {
@@ -601,6 +789,16 @@ static Sentence *session_target_sentence(WriteSession *session) {
     return &session->doc.items[idx];
 }
 
+static bool file_has_active_session(const char *filename) {
+    for (size_t i = 0; i < sizeof(g_write_sessions) / sizeof(g_write_sessions[0]); ++i) {
+        if (!g_write_sessions[i].in_use) continue;
+        if (strcmp(g_write_sessions[i].filename, filename) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool is_number_string(const char *s) {
     if (!s || *s == '\0') return false;
     for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
@@ -630,6 +828,7 @@ static void send_sentence_snapshot(int cfd, const Sentence *sentence) {
 static void handle_write_begin(int cfd, const char *ss_id, const char *client_id, const char *arg);
 static void handle_write_update(int cfd, const char *ss_id, const char *client_id, const char *index_token, const char *arg);
 static void handle_write_commit(int cfd, const char *ss_id, const char *client_id);
+static void handle_undo(int cfd, const char *ss_id, const char *client_id, const char *arg);
 
 static void handle_write_begin(int cfd, const char *ss_id, const char *client_id, const char *arg) {
     if (!arg || *arg == '\0') {
@@ -811,6 +1010,21 @@ static void handle_write_commit(int cfd, const char *ss_id, const char *client_i
         return;
     }
 
+    char undo_path[PATH_MAX];
+    if (undo_path_for(session->filename, undo_path, sizeof(undo_path)) < 0) {
+        dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
+        session_release(session);
+        return;
+    }
+
+    if (copy_file_to_path(path, undo_path) < 0) {
+        if (errno != ENOENT) {
+            dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
+            session_release(session);
+            return;
+        }
+    }
+
     if (write_document_to_path(&session->doc, path, session->original_mode) < 0) {
         dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
         session_release(session);
@@ -820,6 +1034,78 @@ static void handle_write_commit(int cfd, const char *ss_id, const char *client_i
     dprintf(cfd, "ACK %s WRITE COMMIT %s %d\n", ss_id, session->filename, session->sentence_index);
     send_sentence_snapshot(cfd, target);
     session_release(session);
+}
+
+static void handle_undo(int cfd, const char *ss_id, const char *client_id, const char *arg) {
+    (void)client_id;
+    char filename[ID_MAX];
+    if (!arg || sscanf(arg, "%63s", filename) != 1) {
+        dprintf(cfd, "ERR UNDO missing_filename\n");
+        return;
+    }
+    if (!is_valid_name_component(filename)) {
+        dprintf(cfd, "ERR UNDO invalid_filename\n");
+        return;
+    }
+
+    if (file_has_active_session(filename)) {
+        dprintf(cfd, "ERR UNDO write_in_progress\n");
+        return;
+    }
+
+    char current_path[PATH_MAX];
+    if (storage_path_for(filename, current_path, sizeof(current_path)) < 0) {
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
+        return;
+    }
+    struct stat st;
+    if (stat(current_path, &st) < 0) {
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
+        return;
+    }
+
+    char undo_path[PATH_MAX];
+    if (undo_path_for(filename, undo_path, sizeof(undo_path)) < 0) {
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
+        return;
+    }
+    if (stat(undo_path, &st) < 0) {
+        if (errno == ENOENT) {
+            dprintf(cfd, "ERR UNDO no_history\n");
+        } else {
+            dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
+        }
+        return;
+    }
+
+    char swap_path[PATH_MAX];
+    if (swap_path_for(filename, swap_path, sizeof(swap_path)) < 0) {
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
+        return;
+    }
+
+    unlink(swap_path);
+    if (rename(current_path, swap_path) < 0) {
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
+        return;
+    }
+    if (rename(undo_path, current_path) < 0) {
+        int saved = errno;
+        rename(swap_path, current_path);
+        errno = saved;
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
+        return;
+    }
+    if (rename(swap_path, undo_path) < 0) {
+        int saved = errno;
+        rename(current_path, undo_path);
+        rename(swap_path, current_path);
+        errno = saved;
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
+        return;
+    }
+
+    dprintf(cfd, "ACK %s UNDO OK %s\n", ss_id, filename);
 }
 
 int main(void) {
@@ -999,6 +1285,8 @@ int main(void) {
                         handle_write_begin(cfd, ss_id, client_id, arg);
                     } else if (strcmp(verb_upper, "ETIRW") == 0) {
                         handle_write_commit(cfd, ss_id, client_id);
+                    } else if (strcmp(verb_upper, "UNDO") == 0) {
+                        handle_undo(cfd, ss_id, client_id, arg);
                     } else if (is_number_string(verb)) {
                         handle_write_update(cfd, ss_id, client_id, verb, arg);
                     } else {

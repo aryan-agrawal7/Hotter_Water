@@ -146,26 +146,70 @@ static int create_storage_file(const char *filename) {
     return 0;
 }
 
-// metadata directory for each file: <storage_dir>/<filename>.d
+// metadata directory for each file now reuses the file container directory
 static int meta_dir_for(const char *filename, char *out, size_t out_sz) {
     char dir[PATH_MAX];
-    int n = snprintf(dir, sizeof(dir), "%s/%s.d", g_storage_dir, filename);
-    if (n < 0 || (size_t)n >= sizeof(dir)) { errno = ENAMETOOLONG; return -1; }
+    if (storage_dir_for(filename, dir, sizeof(dir)) < 0) {
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(dir, &st) != 0) {
+        if (errno != ENOENT) {
+            return -1;
+        }
+        if (mkdir(dir, 0777) < 0) {
+            return -1;
+        }
+    } else if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+
     if (out) {
-        int m = snprintf(out, out_sz, "%s", dir);
-        if (m < 0 || (size_t)m >= out_sz) {
+        int n = snprintf(out, out_sz, "%s", dir);
+        if (n < 0 || (size_t)n >= out_sz) {
             errno = ENAMETOOLONG;
             return -1;
         }
     }
-    struct stat st;
-    if (stat(dir, &st) == 0) {
-        if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
-        return 0;
-    }
-    if (errno != ENOENT) return -1;
-    if (mkdir(dir, 0777) < 0) return -1;
     return 0;
+}
+
+static void compute_word_line_counts(const char *path, long long *word_count, long long *line_count) {
+    if (word_count) *word_count = 0;
+    if (line_count) *line_count = 0;
+
+    if (!word_count && !line_count) return;
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    long long words = 0;
+    long long lines = 0;
+    bool in_word = false;
+    bool saw_char = false;
+    int last_char = -1;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        saw_char = true;
+        if (c == '\n') lines++;
+        if (isspace((unsigned char)c)) {
+            in_word = false;
+        } else {
+            if (!in_word) {
+                words++;
+                in_word = true;
+            }
+        }
+        last_char = c;
+    }
+    fclose(f);
+
+    if (saw_char && last_char != '\n') lines++;
+
+    if (word_count) *word_count = words;
+    if (line_count) *line_count = lines;
 }
 
 static int write_info_txt(const char *filename, const char *owner, const char *access_str, const char *created_ts, const char *lastmod_ts, const char *last_access_ts, const char *last_access_by) {
@@ -181,6 +225,10 @@ static int write_info_txt(const char *filename, const char *owner, const char *a
     long long size = 0;
     if (stat(data_path, &st) == 0 && S_ISREG(st.st_mode)) size = st.st_size;
 
+    long long word_count = 0;
+    long long line_count = 0;
+    compute_word_line_counts(data_path, &word_count, &line_count);
+
     FILE *f = fopen(info_path, "w");
     if (!f) return -1;
     fprintf(f, "File: %s\n", filename);
@@ -188,6 +236,8 @@ static int write_info_txt(const char *filename, const char *owner, const char *a
     fprintf(f, "Created: %s\n", created_ts ? created_ts : "");
     fprintf(f, "Last Modified: %s\n", lastmod_ts ? lastmod_ts : "");
     fprintf(f, "Size: %lld bytes\n", size);
+    fprintf(f, "Word Count: %lld\n", word_count);
+    fprintf(f, "Line Count: %lld\n", line_count);
     fprintf(f, "Access: %s\n", access_str ? access_str : "");
     fprintf(f, "Last Accessed: %s by %s\n", last_access_ts ? last_access_ts : "", last_access_by? last_access_by : "");
     fclose(f);
@@ -268,6 +318,11 @@ static int delete_storage_file(const char *filename) {
 
     char dir[PATH_MAX];
     if (storage_dir_for(filename, dir, sizeof(dir)) == 0) {
+        char info_path[PATH_MAX];
+        int info_len = snprintf(info_path, sizeof(info_path), "%s/info.txt", dir);
+        if (info_len >= 0 && (size_t)info_len < sizeof(info_path)) {
+            unlink(info_path);
+        }
         rmdir(dir);
     }
     return 0;

@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <time.h>
 
 #define NM_IP   "127.0.0.1"
 #define NM_PORT 5000
@@ -143,6 +144,108 @@ static int create_storage_file(const char *filename) {
         unlink(undo_path);
     }
     return 0;
+}
+
+// metadata directory for each file: <storage_dir>/<filename>.d
+static int meta_dir_for(const char *filename, char *out, size_t out_sz) {
+    char dir[PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%s/%s.d", g_storage_dir, filename);
+    if (n < 0 || (size_t)n >= sizeof(dir)) { errno = ENAMETOOLONG; return -1; }
+    if (out) {
+        int m = snprintf(out, out_sz, "%s", dir);
+        if (m < 0 || (size_t)m >= out_sz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+    }
+    struct stat st;
+    if (stat(dir, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
+        return 0;
+    }
+    if (errno != ENOENT) return -1;
+    if (mkdir(dir, 0777) < 0) return -1;
+    return 0;
+}
+
+static int write_info_txt(const char *filename, const char *owner, const char *access_str, const char *created_ts, const char *lastmod_ts, const char *last_access_ts, const char *last_access_by) {
+    char dir[PATH_MAX];
+    if (meta_dir_for(filename, dir, sizeof(dir)) < 0) return -1;
+    char info_path[PATH_MAX];
+    if (snprintf(info_path, sizeof(info_path), "%s/info.txt", dir) < 0) return -1;
+
+    // determine size
+    char data_path[PATH_MAX];
+    if (storage_path_for(filename, data_path, sizeof(data_path)) < 0) return -1;
+    struct stat st;
+    long long size = 0;
+    if (stat(data_path, &st) == 0 && S_ISREG(st.st_mode)) size = st.st_size;
+
+    FILE *f = fopen(info_path, "w");
+    if (!f) return -1;
+    fprintf(f, "File: %s\n", filename);
+    fprintf(f, "Owner: %s\n", owner ? owner : "");
+    fprintf(f, "Created: %s\n", created_ts ? created_ts : "");
+    fprintf(f, "Last Modified: %s\n", lastmod_ts ? lastmod_ts : "");
+    fprintf(f, "Size: %lld bytes\n", size);
+    fprintf(f, "Access: %s\n", access_str ? access_str : "");
+    fprintf(f, "Last Accessed: %s by %s\n", last_access_ts ? last_access_ts : "", last_access_by? last_access_by : "");
+    fclose(f);
+    return 0;
+}
+
+static void format_time_now(char *out, size_t out_sz) {
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(out, out_sz, "%Y-%m-%d %H:%M:%S", &tm);
+}
+
+// load simple fields from info.txt if present; missing fields left empty
+static void load_info_fields(const char *filename,
+                            char *owner, size_t owner_sz,
+                            char *access_str, size_t access_sz,
+                            char *created_ts, size_t created_sz,
+                            char *lastmod_ts, size_t lastmod_sz,
+                            char *last_access_ts, size_t last_access_sz,
+                            char *last_access_user, size_t last_access_user_sz) {
+    owner[0]='\0'; access_str[0]='\0'; created_ts[0]='\0'; lastmod_ts[0]='\0';
+    last_access_ts[0]='\0'; last_access_user[0]='\0';
+    char dir[PATH_MAX];
+    if (meta_dir_for(filename, dir, sizeof(dir)) < 0) return;
+    char info_path[PATH_MAX];
+    if (snprintf(info_path, sizeof(info_path), "%s/info.txt", dir) < 0) return;
+    FILE *f = fopen(info_path, "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "Owner:", 6) == 0) {
+            char *p = line + 6; while (*p && isspace((unsigned char)*p)) p++; trim_spaces(p); p[strcspn(p, "\r\n")] = '\0'; strncpy(owner, p, owner_sz-1); owner[owner_sz-1]='\0';
+        } else if (strncmp(line, "Access:", 7) == 0) {
+            char *p = line + 7; while (*p && isspace((unsigned char)*p)) p++; trim_spaces(p); p[strcspn(p, "\r\n")] = '\0'; strncpy(access_str, p, access_sz-1); access_str[access_sz-1]='\0';
+        } else if (strncmp(line, "Created:", 8) == 0) {
+            char *p = line + 8; while (*p && isspace((unsigned char)*p)) p++; trim_spaces(p); p[strcspn(p, "\r\n")] = '\0'; strncpy(created_ts, p, created_sz-1); created_ts[created_sz-1]='\0';
+        } else if (strncmp(line, "Last Modified:", 14) == 0) {
+            char *p = line + 14; while (*p && isspace((unsigned char)*p)) p++; trim_spaces(p); p[strcspn(p, "\r\n")] = '\0'; strncpy(lastmod_ts, p, lastmod_sz-1); lastmod_ts[lastmod_sz-1]='\0';
+        } else if (strncmp(line, "Last Accessed:", 14) == 0) {
+            char *p = line + 14; while (*p && isspace((unsigned char)*p)) p++;
+            char *by = strstr(p, " by ");
+            if (by) {
+                *by = '\0'; by += 4;
+                p[strcspn(p, "\r\n")] = '\0';
+                trim_spaces(p);
+                strncpy(last_access_ts, p, last_access_sz-1); last_access_ts[last_access_sz-1]='\0';
+                trim_spaces(by);
+                by[strcspn(by, "\r\n")] = '\0';
+                strncpy(last_access_user, by, last_access_user_sz-1); last_access_user[last_access_user_sz-1]='\0';
+            } else {
+                trim_spaces(p);
+                p[strcspn(p, "\r\n")] = '\0';
+                strncpy(last_access_ts, p, last_access_sz-1); last_access_ts[last_access_sz-1]='\0';
+            }
+        }
+    }
+    fclose(f);
 }
 
 static int delete_storage_file(const char *filename) {
@@ -1031,6 +1134,25 @@ static void handle_write_commit(int cfd, const char *ss_id, const char *client_i
         return;
     }
 
+    // update info metadata: last modified and size
+    char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
+    char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
+    load_info_fields(session->filename,
+                     owner, sizeof(owner),
+                     access_str, sizeof(access_str),
+                     created, sizeof(created),
+                     lastmod, sizeof(lastmod),
+                     last_access_ts, sizeof(last_access_ts),
+                     last_access_user, sizeof(last_access_user));
+    char now[64]; format_time_now(now, sizeof(now));
+    write_info_txt(session->filename,
+                   owner[0]?owner:NULL,
+                   access_str,
+                   created[0]?created:NULL,
+                   now,
+                   now,
+                   client_id);
+
     dprintf(cfd, "ACK %s WRITE COMMIT %s %d\n", ss_id, session->filename, session->sentence_index);
     send_sentence_snapshot(cfd, target);
     session_release(session);
@@ -1185,23 +1307,42 @@ int main(void) {
                     if (strcmp(verb_upper, "CREATE") == 0) {
                         if (!arg || arg[0] == '\0') {
                             dprintf(cfd, "ERR CREATE missing_filename\n");
-                        } else if (!is_valid_name_component(arg)) {
-                            dprintf(cfd, "ERR CREATE invalid_filename\n");
                         } else {
-                            int rc = create_storage_file(arg);
-                            if (rc == 0) {
-                                printf("[SS %s] created file %s for client %s\n", ss_id, arg, client_id);
-                                fflush(stdout);
-                                dprintf(cfd, "ACK %s CREATE OK %s\n", ss_id, arg);
+                            char fname[ID_MAX]={0}, owner_token[ID_MAX]={0};
+                            int got = sscanf(arg, "%63s %63s", fname, owner_token);
+                            if (got < 1 || !is_valid_name_component(fname)) {
+                                dprintf(cfd, "ERR CREATE invalid_filename\n");
                             } else {
-                                int err = errno;
-                                fprintf(stderr, "[SS %s] failed to create file %s for client %s: %s\n",
-                                        ss_id, arg, client_id, strerror(err));
-                                fflush(stderr);
-                                if (err == EEXIST) {
-                                    dprintf(cfd, "ERR CREATE EXISTS %s\n", arg);
+                                int rc = create_storage_file(fname);
+                                if (rc == 0) {
+                                    // create metadata dir and write initial info.txt
+                                    char created[64], lastmod[64];
+                                    format_time_now(created, sizeof(created));
+                                    strncpy(lastmod, created, sizeof(lastmod)-1);
+                                    char access_str[256]; access_str[0]='\0';
+                                    if (got == 2 && owner_token[0]) {
+                                        snprintf(access_str, sizeof(access_str), "%s (RW)", owner_token);
+                                    }
+                                    write_info_txt(fname,
+                                                   (got==2)?owner_token:NULL,
+                                                   access_str,
+                                                   created,
+                                                   lastmod,
+                                                   created,
+                                                   (got==2)?owner_token:NULL);
+                                    printf("[SS %s] created file %s for client %s\n", ss_id, fname, client_id);
+                                    fflush(stdout);
+                                    dprintf(cfd, "ACK %s CREATE OK %s\n", ss_id, fname);
                                 } else {
-                                    dprintf(cfd, "ERR CREATE %s\n", strerror(err));
+                                    int err = errno;
+                                    fprintf(stderr, "[SS %s] failed to create file %s for client %s: %s\n",
+                                            ss_id, fname, client_id, strerror(err));
+                                    fflush(stderr);
+                                    if (err == EEXIST) {
+                                        dprintf(cfd, "ERR CREATE EXISTS %s\n", fname);
+                                    } else {
+                                        dprintf(cfd, "ERR CREATE %s\n", strerror(err));
+                                    }
                                 }
                             }
                         }
@@ -1277,9 +1418,150 @@ int main(void) {
                                     dprintf(cfd, "\nENDDATA %s READ %s\n", ss_id, arg);
                                     printf("[SS %s] streamed file %s to client %s\n", ss_id, arg, client_id);
                                     fflush(stdout);
+                                    // update info.txt last accessed
+                                    char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
+                                    char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
+                                    load_info_fields(arg,
+                                                     owner, sizeof(owner),
+                                                     access_str, sizeof(access_str),
+                                                     created, sizeof(created),
+                                                     lastmod, sizeof(lastmod),
+                                                     last_access_ts, sizeof(last_access_ts),
+                                                     last_access_user, sizeof(last_access_user));
+                                    char now[64]; format_time_now(now, sizeof(now));
+                                    write_info_txt(arg,
+                                                   owner[0]?owner:NULL,
+                                                   access_str,
+                                                   created[0]?created:NULL,
+                                                   lastmod[0]?lastmod:NULL,
+                                                   now,
+                                                   client_id);
                                 }
                                 close(fd);
                             }
+                        }
+                    } else if (strcmp(verb_upper, "EXEC") == 0) {
+                        if (!arg || arg[0] == '\0') {
+                            dprintf(cfd, "ERR EXEC missing_filename\n");
+                        } else if (!is_valid_name_component(arg)) {
+                            dprintf(cfd, "ERR EXEC invalid_filename\n");
+                        } else {
+                            int fd = open_storage_file_ro(arg);
+                            if (fd < 0) {
+                                int err = errno;
+                                fprintf(stderr, "[SS %s] failed to open file %s for EXEC by %s: %s\n",
+                                        ss_id, arg, client_id, strerror(err));
+                                fflush(stderr);
+                                if (err == ENOENT) dprintf(cfd, "ERR EXEC NOTFOUND %s\n", arg);
+                                else dprintf(cfd, "ERR EXEC %s\n", strerror(err));
+                            } else {
+                                struct stat st;
+                                long long declared_size = -1;
+                                if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) declared_size = st.st_size;
+                                dprintf(cfd, "DATA %s EXEC %s %lld\n", ss_id, arg, declared_size);
+                                char buffer[4096]; ssize_t rbytes; int send_failed=0;
+                                while ((rbytes = read(fd, buffer, sizeof(buffer))) > 0) {
+                                    if (send_all(cfd, buffer, (size_t)rbytes) < 0) { send_failed=1; break; }
+                                }
+                                if (rbytes < 0) {
+                                    int err = errno; if (!send_failed) dprintf(cfd, "\nERR EXEC IO %s\n", strerror(err));
+                                } else if (!send_failed) {
+                                    dprintf(cfd, "\nENDDATA %s EXEC %s\n", ss_id, arg);
+                                    printf("[SS %s] sent EXEC payload %s to %s\n", ss_id, arg, client_id); fflush(stdout);
+                                }
+                                close(fd);
+                                // update last access
+                                char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
+                                char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
+                                load_info_fields(arg,
+                                                 owner, sizeof(owner),
+                                                 access_str, sizeof(access_str),
+                                                 created, sizeof(created),
+                                                 lastmod, sizeof(lastmod),
+                                                 last_access_ts, sizeof(last_access_ts),
+                                                 last_access_user, sizeof(last_access_user));
+                                char now[64]; format_time_now(now, sizeof(now));
+                                write_info_txt(arg,
+                                               owner[0]?owner:NULL,
+                                               access_str,
+                                               created[0]?created:NULL,
+                                               lastmod[0]?lastmod:NULL,
+                                               now,
+                                               client_id);
+                            }
+                        }
+                    } else if (strcmp(verb_upper, "INFO") == 0) {
+                        if (!arg || arg[0] == '\0') { dprintf(cfd, "ERR INFO missing_filename\n"); }
+                        else if (!is_valid_name_component(arg)) { dprintf(cfd, "ERR INFO invalid_filename\n"); }
+                        else {
+                            char dir[PATH_MAX];
+                            if (meta_dir_for(arg, dir, sizeof(dir)) < 0) { dprintf(cfd, "ERR INFO no_metadata %s\n", arg); }
+                            else {
+                                char info_path[PATH_MAX]; snprintf(info_path, sizeof(info_path), "%s/info.txt", dir);
+                                FILE *f = fopen(info_path, "r");
+                                if (!f) { dprintf(cfd, "ERR INFO missing %s\n", arg); }
+                                else { char line[1024]; while (fgets(line, sizeof(line), f)) send_all(cfd, line, strlen(line)); fclose(f); }
+                            }
+                        }
+                    } else if (strcmp(verb_upper, "ADDACCESS") == 0) {
+                        char flag[16]={0}, fname[ID_MAX]={0}, user[ID_MAX]={0};
+                        if (!arg || sscanf(arg, "%15s %63s %63s", flag, fname, user) != 3) { dprintf(cfd, "ERR ADDACCESS bad_args\n"); }
+                        else {
+                            char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
+                            char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
+                            load_info_fields(fname,
+                                             owner, sizeof(owner),
+                                             access_str, sizeof(access_str),
+                                             created, sizeof(created),
+                                             lastmod, sizeof(lastmod),
+                                             last_access_ts, sizeof(last_access_ts),
+                                             last_access_user, sizeof(last_access_user));
+                            if (strstr(access_str, user) == NULL) {
+                                char new_access[512]; if (access_str[0]) snprintf(new_access, sizeof(new_access), "%s, %s (%s)", access_str, user, (strcmp(flag, "-W")==0)?"RW":"R"); else snprintf(new_access, sizeof(new_access), "%s (%s)", user, (strcmp(flag, "-W")==0)?"RW":"R");
+                                strncpy(access_str, new_access, sizeof(access_str)-1); access_str[sizeof(access_str)-1]='\0';
+                            }
+                            write_info_txt(fname,
+                                           owner[0]?owner:NULL,
+                                           access_str,
+                                           created[0]?created:NULL,
+                                           lastmod[0]?lastmod:NULL,
+                                           last_access_ts[0]?last_access_ts:NULL,
+                                           last_access_user[0]?last_access_user:NULL);
+                            dprintf(cfd, "ACK %s ADDACCESS %s %s %s\n", ss_id, flag, fname, user);
+                        }
+                    } else if (strcmp(verb_upper, "REMACCESS") == 0) {
+                        char fname[ID_MAX]={0}, user[ID_MAX]={0};
+                        if (!arg || sscanf(arg, "%63s %63s", fname, user) != 2) { dprintf(cfd, "ERR REMACCESS bad_args\n"); }
+                        else {
+                            char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
+                            char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
+                            load_info_fields(fname,
+                                             owner, sizeof(owner),
+                                             access_str, sizeof(access_str),
+                                             created, sizeof(created),
+                                             lastmod, sizeof(lastmod),
+                                             last_access_ts, sizeof(last_access_ts),
+                                             last_access_user, sizeof(last_access_user));
+                            char tmp[512]; tmp[0]='\0';
+                            char acc_copy[512]; strncpy(acc_copy, access_str, sizeof(acc_copy)-1); acc_copy[sizeof(acc_copy)-1]='\0';
+                            char *tok = strtok(acc_copy, ","); bool first=true;
+                            while (tok) {
+                                if (strstr(tok, user) == NULL) {
+                                    if (!first) strncat(tmp, ",", sizeof(tmp)-strlen(tmp)-1);
+                                    strncat(tmp, tok, sizeof(tmp)-strlen(tmp)-1);
+                                    first=false;
+                                }
+                                tok = strtok(NULL, ",");
+                            }
+                            strncpy(access_str, tmp, sizeof(access_str)-1); access_str[sizeof(access_str)-1]='\0';
+                            write_info_txt(fname,
+                                           owner[0]?owner:NULL,
+                                           access_str,
+                                           created[0]?created:NULL,
+                                           lastmod[0]?lastmod:NULL,
+                                           last_access_ts[0]?last_access_ts:NULL,
+                                           last_access_user[0]?last_access_user:NULL);
+                            dprintf(cfd, "ACK %s REMACCESS %s %s\n", ss_id, fname, user);
                         }
                     } else if (strcmp(verb_upper, "WRITE") == 0) {
                         handle_write_begin(cfd, ss_id, client_id, arg);

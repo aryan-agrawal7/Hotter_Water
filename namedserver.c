@@ -32,6 +32,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -659,11 +660,11 @@ static void handle_create(int cfd, const char *client, const char *fname){
 
     // notify SS (single line)
     char payload[LINE_MAX];
-    snprintf(payload,sizeof(payload), "CREATE %s", fname);
+    snprintf(payload,sizeof(payload), "CREATE %s %s", fname, client);
     send_one_line_to_ss(ss.id, client, payload, cfd);
 }
 
-static void handle_addaccess(int cfd, const char *flag, const char *fname, const char *user){
+static void handle_addaccess(int cfd, const char *client, const char *flag, const char *fname, const char *user){
     if(!flag || !fname || !user){ send_line(cfd,"ERROR BAD_ADDACCESS"); return; }
     pthread_mutex_lock(&g_mtx);
     int i = fv_find(&ALL_FILES, fname);
@@ -672,11 +673,15 @@ static void handle_addaccess(int cfd, const char *flag, const char *fname, const
     if(strcmp(flag,"-R")==0)      sl_add_unique(&m->rd, user);
     else if(strcmp(flag,"-W")==0) sl_add_unique(&m->wr, user);
     else { pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR BAD_FLAG"); return; }
+    // notify SS to persist access change
+    char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "ADDACCESS %s %s %s", flag, fname, user);
+    char ss_id[ID_MAX]; strncpy(ss_id, m->ss_id, ID_MAX-1); ss_id[ID_MAX-1]='\0';
     pthread_mutex_unlock(&g_mtx);
     send_line(cfd, "OK ADDACCESS %s %s %s", flag, fname, user);
+    send_one_line_to_ss(ss_id, client, payload, cfd);
 }
 
-static void handle_remaccess(int cfd, const char *fname, const char *user){
+static void handle_remaccess(int cfd, const char *client, const char *fname, const char *user){
     if(!fname || !user){ send_line(cfd,"ERROR BAD_REMACCESS"); return; }
     pthread_mutex_lock(&g_mtx);
     int i = fv_find(&ALL_FILES, fname);
@@ -684,8 +689,11 @@ static void handle_remaccess(int cfd, const char *fname, const char *user){
     FILE_META_DATA *m=&ALL_FILES.v[i];
     sl_remove(&m->rd, user);
     sl_remove(&m->wr, user);
+    char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "REMACCESS %s %s", fname, user);
+    char ss_id[ID_MAX]; strncpy(ss_id, m->ss_id, ID_MAX-1); ss_id[ID_MAX-1]='\0';
     pthread_mutex_unlock(&g_mtx);
     send_line(cfd, "OK REMACCESS %s %s", fname, user);
+    send_one_line_to_ss(ss_id, client, payload, cfd);
 }
 
 static void handle_delete(int cfd, const char *client, const char *fname){
@@ -892,7 +900,7 @@ static void *worker(void *arg_) {
             if (strcasecmp(verb,"ADDACCESS")==0) {
                 char flag[8]={0}, fname[FNAME_MAX]={0}, user[ID_MAX]={0};
                 if (sscanf(payload, "ADDACCESS %7s %255s %63s", flag, fname, user)==3)
-                    handle_addaccess(fd, flag, fname, user);
+                    handle_addaccess(fd, client_id, flag, fname, user);
                 else send_line(fd,"ERROR BAD_ADDACCESS");
                 close(fd); return NULL;
             }
@@ -900,7 +908,7 @@ static void *worker(void *arg_) {
             if (strcasecmp(verb,"REMACCESS")==0) {
                 char fname[FNAME_MAX]={0}, user[ID_MAX]={0};
                 if (sscanf(payload, "REMACCESS %255s %63s", fname, user)==2)
-                    handle_remaccess(fd, fname, user);
+                    handle_remaccess(fd, client_id, fname, user);
                 else send_line(fd,"ERROR BAD_REMACCESS");
                 close(fd); return NULL;
             }
@@ -929,13 +937,153 @@ static void *worker(void *arg_) {
                 close(fd); return NULL;
             }
 
-            if (strcasecmp(verb,"EXEC")==0) {
-                char fname[FNAME_MAX]={0};
-                if (sscanf(payload, "EXEC %255s", fname)==1)
-                    handle_stream_or_exec(fd, client_id, "EXEC", fname);
-                else send_line(fd,"ERROR BAD_EXEC");
-                close(fd); return NULL;
-            }
+                    if (strcasecmp(verb,"INFO")==0) {
+                        char fname[FNAME_MAX]={0};
+                        if (sscanf(payload, "INFO %255s", fname)==1) {
+                            pthread_mutex_lock(&g_mtx);
+                            int i=fv_find(&ALL_FILES, fname);
+                            if (i<0) { pthread_mutex_unlock(&g_mtx); send_line(fd,"ERROR NO_SUCH_FILE"); }
+                            else {
+                                FILE_META_DATA *m=&ALL_FILES.v[i];
+                                bool ok = has_read(m, client_id) || has_write(m, client_id) || has_exec(m, client_id) || strcmp(m->owner, client_id)==0;
+                                int sidx = ss_find_index(m->ss_id);
+                                SSInfo ss_ref;
+                                if(!ok){ pthread_mutex_unlock(&g_mtx); send_line(fd,"ERROR PERMISSION_DENIED"); }
+                                else if (sidx<0){ pthread_mutex_unlock(&g_mtx); send_line(fd,"ERROR STORAGE_SERVER_NOT_FOUND %s", m->ss_id); }
+                                else {
+                                    ss_ref = g_ss[sidx];
+                                    pthread_mutex_unlock(&g_mtx);
+                                    char payload_info[LINE_MAX]; snprintf(payload_info,sizeof(payload_info), "INFO %s", fname);
+                                    send_one_line_to_ss(ss_ref.id, client_id, payload_info, fd);
+                                }
+                            }
+                        } else send_line(fd,"ERROR BAD_INFO");
+                        close(fd); return NULL;
+                    }
+
+                    if (strcasecmp(verb,"EXEC")==0) {
+                        char fname[FNAME_MAX]={0};
+                        if (sscanf(payload, "EXEC %255s", fname)==1) {
+                            // special handling: fetch file from SS and execute on NM
+                            // perform permission check and locate SS
+                            pthread_mutex_lock(&g_mtx);
+                            int i=fv_find(&ALL_FILES, fname);
+                            if (i<0) { pthread_mutex_unlock(&g_mtx); send_line(fd,"ERROR NO_SUCH_FILE"); }
+                            else {
+                                FILE_META_DATA *m=&ALL_FILES.v[i];
+                                bool ok = has_read(m, client_id);
+                                int sidx = ss_find_index(m->ss_id);
+                                SSInfo ss_ref;
+                                if(!ok) { pthread_mutex_unlock(&g_mtx); send_line(fd,"ERROR PERMISSION_DENIED"); }
+                                else if (sidx<0) { pthread_mutex_unlock(&g_mtx); send_line(fd,"ERROR STORAGE_SERVER_NOT_FOUND %s", m->ss_id); }
+                                else {
+                                    ss_ref = g_ss[sidx];
+                                    pthread_mutex_unlock(&g_mtx);
+                                    // connect to SS and request file
+                                    int ssfd = connect_to_host(ss_ref.ip, ss_ref.client_port);
+                                    if (ssfd<0) { send_line(fd,"ERROR CONNECT_SS_FAILED %s", ss_ref.id); }
+                                    else {
+                                        // send HELLO to SS with EXEC request
+                                        dprintf(ssfd, "HELLO %s EXEC %s\n", client_id, fname);
+                                        // read header line
+                                        char header[LINE_MAX]; if (read_line(ssfd, header, sizeof(header))<=0) { close(ssfd); send_line(fd, "ERROR EXEC_NO_DATA"); }
+                                        else {
+                                            // expect: DATA <ss_id> EXEC <fname> <size>
+                                            char tag[32], ssid[ID_MAX], verb2[32], fname2[FNAME_MAX]; long long size = -1;
+                                            int parsed = sscanf(header, "%31s %63s %31s %255s %lld", tag, ssid, verb2, fname2, &size);
+                                            if (parsed >= 4) {
+                                                if (strcmp(tag,"DATA")!=0 || strcasecmp(verb2,"EXEC")!=0) {
+                                                    // pipe remainder back
+                                                    char buf[LINE_MAX]; ssize_t n;
+                                                    while((n=recv(ssfd, buf, sizeof(buf),0))>0) send(fd, buf, n, MSG_NOSIGNAL);
+                                                    close(ssfd);
+                                                } else {
+                                                    // read exactly 'size' bytes into temp file
+                                                    char tmp_template[] = "/tmp/nm_exec_XXXXXX";
+                                                    int tmpfd = mkstemp(tmp_template);
+                                                    if (tmpfd<0) { close(ssfd); send_line(fd,"ERROR EXEC_TMPFAIL"); }
+                                                    else {
+                                                        long long toread = size;
+                                                        bool size_known = (parsed == 5 && size >= 0);
+                                                        bool ok = true;
+                                                        char buf[4096];
+                                                        while (toread != 0) {
+                                                            size_t chunk = (toread < 0 || (long long)sizeof(buf) < toread) ? sizeof(buf) : (size_t)toread;
+                                                            ssize_t r = recv(ssfd, buf, chunk, 0);
+                                                            if (r <= 0) { ok = false; break; }
+                                                            ssize_t woff = 0;
+                                                            while (woff < r) {
+                                                                ssize_t w = write(tmpfd, buf + woff, (size_t)(r - woff));
+                                                                if (w < 0) {
+                                                                    if (errno == EINTR) continue;
+                                                                    ok = false;
+                                                                    break;
+                                                                }
+                                                                woff += w;
+                                                            }
+                                                            if (!ok) break;
+                                                            if (toread > 0) toread -= r;
+                                                            if (!size_known && r < (ssize_t)sizeof(buf)) break; // heuristic break when source ends
+                                                        }
+                                                        fsync(tmpfd); close(tmpfd);
+
+                                                        // consume trailing ENDDATA (skip blank lines)
+                                                        char trailing[LINE_MAX];
+                                                        int rl;
+                                                        do {
+                                                            rl = (int)read_line(ssfd, trailing, sizeof(trailing));
+                                                            if (rl <= 0) break;
+                                                        } while (trailing[0] == '\0');
+                                                        close(ssfd);
+
+                                                        bool got_end = (rl > 0 && strncmp(trailing, "ENDDATA", 7) == 0);
+                                                        if (!got_end && size_known && toread <= 0) {
+                                                            got_end = true; // treat lack of ENDDATA as success when full payload received
+                                                        }
+                                                        if (size_known && toread > 0) ok = false;
+
+                                                        if (!ok || !got_end) {
+                                                            send_line(fd, "ERROR EXEC_TRANSFER");
+                                                            unlink(tmp_template);
+                                                        } else {
+                                                            // execute temp script and stream output
+                                                            char cmd[PATH_MAX+32]; snprintf(cmd, sizeof(cmd), "sh %s 2>&1", tmp_template);
+                                                            FILE *pf = popen(cmd, "r");
+                                                            if (!pf) {
+                                                                send_line(fd, "ERROR EXEC_RUN");
+                                                                unlink(tmp_template);
+                                                            } else {
+                                                                send_line(fd, "BEGIN_EXEC_OUTPUT");
+                                                                char outbuf[4096];
+                                                                while (fgets(outbuf, sizeof(outbuf), pf)) {
+                                                                    size_t out_len = strlen(outbuf);
+                                                                    size_t sent = 0;
+                                                                    while (sent < out_len) {
+                                                                        ssize_t w = send(fd, outbuf + sent, out_len - sent, MSG_NOSIGNAL);
+                                                                        if (w <= 0) break;
+                                                                        sent += (size_t)w;
+                                                                    }
+                                                                }
+                                                                pclose(pf);
+                                                                send_line(fd, "END_EXEC_OUTPUT");
+                                                                unlink(tmp_template);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                // header not as expected: pipe everything
+                                                char buf[LINE_MAX]; ssize_t n;
+                                                while((n=recv(ssfd, buf, sizeof(buf),0))>0) send(fd, buf, n, MSG_NOSIGNAL);
+                                                close(ssfd);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else send_line(fd,"ERROR BAD_EXEC");
+                        close(fd); return NULL;
+                    }
 
             if (strcasecmp(verb,"WRITE")==0) {
                 char fname[FNAME_MAX]={0}; char sent[64]={0};

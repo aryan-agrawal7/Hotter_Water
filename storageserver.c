@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
+#include <signal.h>
 
 #define NM_IP   "127.0.0.1"
 #define NM_PORT 5000
@@ -351,6 +352,11 @@ static int send_all(int fd, const void *buf, size_t len) {
 }
 
 static int write_all_fd(int fd, const char *buf, size_t len);
+
+static void send_stop_packet(int fd, const char *verb, const char *fname) {
+    const char *name = (fname && *fname) ? fname : "-";
+    dprintf(fd, "STOP %s %s\n", verb, name);
+}
 
 typedef struct {
     char **data;
@@ -1286,6 +1292,7 @@ static void handle_undo(int cfd, const char *ss_id, const char *client_id, const
 }
 
 int main(void) {
+    signal(SIGPIPE, SIG_IGN);
     char ss_id[ID_MAX];
     int client_port;
 
@@ -1424,6 +1431,7 @@ int main(void) {
                             }
                         }
                     } else if (strcmp(verb_upper, "READ") == 0) {
+                        const char *read_name = (arg && arg[0]) ? arg : "-";
                         if (!arg || arg[0] == '\0') {
                             dprintf(cfd, "ERR READ missing_filename\n");
                         } else if (!is_valid_name_component(arg)) {
@@ -1495,6 +1503,63 @@ int main(void) {
                                 close(fd);
                             }
                         }
+                        send_stop_packet(cfd, "READ", read_name);
+                    } else if (strcmp(verb_upper, "STREAM") == 0) {
+                        const char *stream_name = (arg && arg[0]) ? arg : "-";
+                        if (!arg || arg[0] == '\0') {
+                            dprintf(cfd, "ERR STREAM missing_filename\n");
+                        } else if (!is_valid_name_component(arg)) {
+                            dprintf(cfd, "ERR STREAM invalid_filename\n");
+                        } else {
+                            char path[PATH_MAX];
+                            if (storage_path_for(arg, path, sizeof(path)) < 0) {
+                                dprintf(cfd, "ERR STREAM %s\n", strerror(errno));
+                            } else {
+                                FILE *f = fopen(path, "r");
+                                if (!f) {
+                                    dprintf(cfd, "ERR STREAM %s\n", strerror(errno));
+                                } else {
+                                    printf("[SS %s] streaming file %s to client %s\n", ss_id, arg, client_id);
+                                    fflush(stdout);
+                                    char word[1024];
+                                    bool send_error = false;
+                                    while (fscanf(f, "%1023s", word) == 1) {
+                                        size_t len = strlen(word);
+                                        if (send_all(cfd, word, len) < 0 || send_all(cfd, " ", 1) < 0) {
+                                            send_error = true;
+                                            int err = errno;
+                                            fprintf(stderr, "[SS %s] client %s disconnected mid-stream for %s: %s\n",
+                                                    ss_id, client_id, arg, strerror(err));
+                                            fflush(stderr);
+                                            break;
+                                        }
+                                        usleep(100000);
+                                    }
+                                    fclose(f);
+                                    if (!send_error) {
+                                        send_all(cfd, "\n", 1);
+                                        char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
+                                        char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
+                                        load_info_fields(arg,
+                                                         owner, sizeof(owner),
+                                                         access_str, sizeof(access_str),
+                                                         created, sizeof(created),
+                                                         lastmod, sizeof(lastmod),
+                                                         last_access_ts, sizeof(last_access_ts),
+                                                         last_access_user, sizeof(last_access_user));
+                                        char now[64]; format_time_now(now, sizeof(now));
+                                        write_info_txt(arg,
+                                                       owner[0]?owner:NULL,
+                                                       access_str,
+                                                       created[0]?created:NULL,
+                                                       lastmod[0]?lastmod:NULL,
+                                                       now,
+                                                       client_id);
+                                    }
+                                }
+                            }
+                        }
+                        send_stop_packet(cfd, "STREAM", stream_name);
                     } else if (strcmp(verb_upper, "EXEC") == 0) {
                         if (!arg || arg[0] == '\0') {
                             dprintf(cfd, "ERR EXEC missing_filename\n");

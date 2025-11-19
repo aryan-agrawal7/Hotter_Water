@@ -11,8 +11,8 @@
 // * For WRITE, we open one connection, send "WRITE <file> <sentence_idx>" once,
 //   then forward every user line verbatim until "ETIRW", then read till EOF and print.
 //
-// You can run multiple clients (each in its own terminal). This file does not connect to storage
-// servers directly in Step-2; the Name Server handles routing/proxying.
+// You can run multiple clients (each in its own terminal). READ/WRITE/STREAM commands now connect
+// directly to the appropriate Storage Server based on directions received from the Name Server.
 //
 // Build: gcc -o Client Client.c
 // Run:   ./Client
@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -33,6 +34,8 @@
 #define NM_PORT  5000
 #define ID_MAX   64
 #define LINE_MAX 4096
+#define FNAME_MAX 256
+#define IP_MAX    64
 
 // --- helpers ---
 static int connect_addr(const char *ip, int port) {
@@ -67,15 +70,130 @@ static void read_all_and_print(int fd) {
     // Print everything the NM sends until it closes the socket.
     char buf[LINE_MAX];
     ssize_t n;
+    bool printed_any = false;
+    bool ended_with_newline = true;
     while ((n = recv(fd, buf, sizeof(buf)-1, 0)) > 0) {
         buf[n] = '\0';
         fputs(buf, stdout);
         fflush(stdout);
+        printed_any = true;
+        ended_with_newline = (buf[n-1] == '\n');
+    }
+    if (n < 0) {
+        fprintf(stderr, "[Client] connection lost while receiving data: %s\n", strerror(errno));
+    }
+    if (printed_any && !ended_with_newline) {
+        printf("\n");
+        fflush(stdout);
     }
 }
 
-static bool has_prefix(const char *s, const char *pfx) {
-    return strncmp(s, pfx, strlen(pfx)) == 0;
+typedef struct {
+    char verb[16];
+    char filename[FNAME_MAX];
+    char extra[64];
+    char ss_id[ID_MAX];
+    char ip[IP_MAX];
+    int port;
+} DirectEndpoint;
+
+static bool request_direct_endpoint(const char *client_id, const char *cmdline, DirectEndpoint *out) {
+    int nmfd = connect_addr(NM_IP, NM_PORT);
+    if (nmfd < 0) return false;
+    dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
+    char first_line[LINE_MAX];
+    ssize_t got = read_line(nmfd, first_line, sizeof(first_line));
+    if (got <= 0) {
+        printf("ERROR no response from Name Server\n");
+        close(nmfd);
+        return false;
+    }
+    if (strncmp(first_line, "DIRECT ", 7) != 0) {
+        if (first_line[0] != '\0') {
+            printf("%s\n", first_line);
+        }
+        read_all_and_print(nmfd);
+        close(nmfd);
+        return false;
+    }
+    DirectEndpoint tmp;
+    if (sscanf(first_line, "DIRECT %15s %255s %63s %63s %63s %d",
+               tmp.verb, tmp.filename, tmp.extra, tmp.ss_id, tmp.ip, &tmp.port) != 6) {
+        printf("ERROR malformed DIRECT response: %s\n", first_line);
+        close(nmfd);
+        return false;
+    }
+    *out = tmp;
+    close(nmfd);
+    return true;
+}
+
+static bool send_command_to_ss(const DirectEndpoint *ep, const char *client_id, const char *payload) {
+    int ssfd = connect_addr(ep->ip, ep->port);
+    if (ssfd < 0) {
+        fprintf(stderr, "[Client] unable to connect to storage server %s (%s:%d)\n",
+                ep->ss_id, ep->ip, ep->port);
+        return false;
+    }
+    if (dprintf(ssfd, "HELLO %s %s\n", client_id, payload) < 0) {
+        perror("send");
+        close(ssfd);
+        return false;
+    }
+    read_all_and_print(ssfd);
+    close(ssfd);
+    return true;
+}
+
+static void handle_direct_read(const char *client_id, const char *cmdline) {
+    DirectEndpoint ep;
+    if (!request_direct_endpoint(client_id, cmdline, &ep)) return;
+    char payload[LINE_MAX];
+    if (strcmp(ep.extra, "-") == 0) snprintf(payload, sizeof(payload), "READ %s", ep.filename);
+    else snprintf(payload, sizeof(payload), "READ %s %s", ep.filename, ep.extra);
+    send_command_to_ss(&ep, client_id, payload);
+}
+
+static void handle_direct_stream(const char *client_id, const char *cmdline) {
+    DirectEndpoint ep;
+    if (!request_direct_endpoint(client_id, cmdline, &ep)) return;
+    char payload[LINE_MAX];
+    snprintf(payload, sizeof(payload), "STREAM %s", ep.filename);
+    send_command_to_ss(&ep, client_id, payload);
+}
+
+static void handle_direct_write(const char *client_id, const char *cmdline) {
+    DirectEndpoint ep;
+    if (!request_direct_endpoint(client_id, cmdline, &ep)) return;
+    if (strcmp(ep.extra, "-") == 0) {
+        printf("ERROR WRITE missing sentence index\n");
+        return;
+    }
+
+    char header[LINE_MAX];
+    snprintf(header, sizeof(header), "WRITE %s %s", ep.filename, ep.extra);
+    if (!send_command_to_ss(&ep, client_id, header)) {
+        return;
+    }
+
+    printf("[Client %s] Enter <word_index> <content> lines. Finish with ETIRW.\n", client_id);
+    char line[LINE_MAX];
+    while (1) {
+        printf("write> "); fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) {
+            printf("\n[Client %s] EOF during WRITE; sending ETIRW to release lock.\n", client_id);
+            send_command_to_ss(&ep, client_id, "ETIRW");
+            break;
+        }
+        size_t len = strlen(line);
+        if (len && line[len-1] == '\n') line[len-1] = '\0';
+        if (line[0] == '\0') continue;
+        if (strcmp(line, "ETIRW") == 0) {
+            send_command_to_ss(&ep, client_id, "ETIRW");
+            break;
+        }
+        send_command_to_ss(&ep, client_id, line);
+    }
 }
 
 // --- main ---
@@ -126,45 +244,26 @@ int main(void) {
             break;
         }
 
-        // Open one connection per *command*.
+        char verb_token[16]={0};
+        sscanf(cmdline, "%15s", verb_token);
+        if (strcasecmp(verb_token, "READ") == 0) {
+            handle_direct_read(client_id, cmdline);
+            continue;
+        }
+        if (strcasecmp(verb_token, "WRITE") == 0) {
+            handle_direct_write(client_id, cmdline);
+            continue;
+        }
+        if (strcasecmp(verb_token, "STREAM") == 0) {
+            handle_direct_stream(client_id, cmdline);
+            continue;
+        }
+
         int nmfd = connect_addr(NM_IP, NM_PORT);
         if (nmfd < 0) { continue; }
-
-        // Always prefix client id so NM can authz/audit
-        // (NM can accept either "REQUEST <id> <payload>" or direct payloads that begin with verbs.)
-        // We use a simple unified line: CLIENT <id> <payload>
-        if (has_prefix(cmdline, "WRITE ")) {
-            // 1) send the first WRITE line
-            dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
-
-            // 2) now forward subsequent user lines until ETIRW
-            while (1) {
-                char line[LINE_MAX];
-                if (!fgets(line, sizeof(line), stdin)) {
-                    // EOF mid-write: still let NM handle it (socket will close from our side)
-                    break;
-                }
-                size_t l = strlen(line);
-                if (l && line[l-1] == '\n') line[l-1] = '\0';
-
-                // Echo user typing? optional; keep quiet.
-                dprintf(nmfd, "%s\n", line);
-
-                if (strcmp(line, "ETIRW") == 0) {
-                    // done sending; read server output till EOF
-                    break;
-                }
-            }
-
-            // 3) print everything NM returns (status/errors/redirect text/streamed result)
-            read_all_and_print(nmfd);
-            close(nmfd);
-        } else {
-            // Single-line commands: forward line and print all output till EOF
-            dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
-            read_all_and_print(nmfd);
-            close(nmfd);
-        }
+        dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
+        read_all_and_print(nmfd);
+        close(nmfd);
     }
     return 0;
 }

@@ -745,13 +745,8 @@ static void handle_read(int cfd, const char *client, const char *fname, const ch
     ss_ref = g_ss[sidx];
     pthread_mutex_unlock(&g_mtx);
 
-    char payload[LINE_MAX];
-    if (sentence_opt && *sentence_opt)
-        snprintf(payload, sizeof(payload), "READ %s %s", fname, sentence_opt);
-    else
-        snprintf(payload, sizeof(payload), "READ %s", fname);
-
-    send_one_line_to_ss(ss_ref.id, client, payload, cfd);
+    const char *sent_tok = (sentence_opt && *sentence_opt) ? sentence_opt : "-";
+    send_line(cfd, "DIRECT READ %s %s %s %s %d", fname, sent_tok, ss_ref.id, ss_ref.ip, ss_ref.client_port);
 }
 
 static void handle_stream_or_exec(int cfd, const char *client, const char *verb, const char *fname){
@@ -767,8 +762,12 @@ static void handle_stream_or_exec(int cfd, const char *client, const char *verb,
     ss_ref = g_ss[sidx];
     pthread_mutex_unlock(&g_mtx);
 
-    char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "%s %s", verb, fname);
-    send_one_line_to_ss(ss_ref.id, client, payload, cfd);
+    if(strcmp(verb, "STREAM")==0){
+        send_line(cfd, "DIRECT STREAM %s - %s %s %d", fname, ss_ref.id, ss_ref.ip, ss_ref.client_port);
+    }else{
+        char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "%s %s", verb, fname);
+        send_one_line_to_ss(ss_ref.id, client, payload, cfd);
+    }
 }
 
 static void handle_undo(int cfd, const char *client, const char *fname){
@@ -788,36 +787,26 @@ static void handle_undo(int cfd, const char *client, const char *fname){
 }
 
 static void handle_write(int cfd, const char *client, const char *fname, const char *sent_str, int client_fd){
+    (void)client_fd;
     if(!fname || !sent_str){ send_line(cfd,"ERROR BAD_WRITE"); return; }
     int sentence = atoi(sent_str);
+    if(sentence <= 0){ send_line(cfd,"ERROR BAD_WRITE_SENTENCE"); return; }
 
     pthread_mutex_lock(&g_mtx);
     int i=fv_find(&ALL_FILES, fname);
-    if(i<0){ pthread_mutex_unlock(&g_mtx); // drain input until ETIRW
-        send_line(cfd,"ERROR NO_SUCH_FILE");
-        return;
-    }
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
     FILE_META_DATA *m=&ALL_FILES.v[i];
     bool ok = has_write(m, client);
-    char ss_id[ID_MAX]; strncpy(ss_id, m->ss_id, ID_MAX-1); ss_id[ID_MAX-1]='\0';
+    int sidx = ss_find_index(m->ss_id);
+    SSInfo ss_ref;
+    if(sidx>=0) ss_ref = g_ss[sidx];
+    char target_ss[ID_MAX]; strncpy(target_ss, m->ss_id, ID_MAX-1); target_ss[ID_MAX-1]='\0';
     pthread_mutex_unlock(&g_mtx);
 
-    // We'll always DRAIN the client's lines until ETIRW.
-    // If permitted, forward each line as its own single-line HELLO to SS.
-    // Start by forwarding the header line too.
-    char header[LINE_MAX]; snprintf(header,sizeof(header),"WRITE %s %d", fname, sentence);
-    if(ok) send_one_line_to_ss(ss_id, client, header, client_fd);
+    if(!ok){ send_line(cfd,"ERROR PERMISSION_DENIED"); return; }
+    if(sidx<0){ send_line(cfd,"ERROR STORAGE_SERVER_NOT_FOUND %s", target_ss); return; }
 
-    // Now loop reading lines from the client socket until ETIRW
-    char line[LINE_MAX];
-    for(;;){
-        ssize_t n = read_line(client_fd, line, sizeof(line));
-        if(n<=0) break; // client closed unexpectedly
-        if(ok) send_one_line_to_ss(ss_id, client, line, client_fd);
-        if(strcmp(line,"ETIRW")==0) break;
-    }
-    if(!ok) send_line(cfd,"ERROR PERMISSION_DENIED");
-    else    send_line(cfd,"OK WRITE SENT");
+    send_line(cfd, "DIRECT WRITE %s %s %s %s %d", fname, sent_str, ss_ref.id, ss_ref.ip, ss_ref.client_port);
 }
 
 // ----------------------- worker thread -----------------------

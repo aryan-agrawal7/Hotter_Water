@@ -597,10 +597,29 @@ static void print_file_long(int fd, const FILE_META_DATA *m){
 
 // ----------------------- command handling -----------------------
 static void handle_view(int cfd, const char *client, const char *flag){
+    bool all = false;
+    bool longlist = false;
+
+    if(flag){
+        size_t flag_len = strlen(flag);
+        if(flag_len >= 8){
+            send_line(cfd, "ERROR incorrect flags for VIEW");
+            return;
+        }
+        if(strcmp(flag,"-a")==0){
+            all = true;
+        } else if(strcmp(flag,"-l")==0){
+            longlist = true;
+        } else if(strcmp(flag,"-al")==0 || strcmp(flag,"-la")==0){
+            all = true;
+            longlist = true;
+        } else {
+            send_line(cfd, "ERROR incorrect flags for VIEW");
+            return;
+        }
+    }
+
     pthread_mutex_lock(&g_mtx);
-    bool all      = (flag && strcmp(flag,"-a")==0);
-    bool longlist = (flag && (strcmp(flag,"-l")==0 || strcmp(flag,"-al")==0 || strcmp(flag,"-la")==0));
-    if(flag && (strcmp(flag,"-al")==0 || strcmp(flag,"-la")==0)){ all=true; longlist=true; }
     if(!flag || longlist) {
         send_line(cfd, "VIEW results:");
     }
@@ -663,15 +682,24 @@ static void handle_create(int cfd, const char *client, const char *fname){
 }
 
 static void handle_addaccess(int cfd, const char *client, const char *flag, const char *fname, const char *user){
-    if(!flag || !fname || !user){ send_line(cfd,"ERROR You dont have access"); return; }
+    if(!flag || !*flag || !fname || !*fname || !user || !*user){
+        send_line(cfd, "ERROR BAD_ADDACCESS");
+        return;
+    }
+    if(strcmp(flag, "-R")!=0 && strcmp(flag, "-W")!=0){
+        send_line(cfd, "ERROR incorrect Flags");
+        return;
+    }
+
     pthread_mutex_lock(&g_mtx);
     int i = fv_find(&ALL_FILES, fname);
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR File Doesnt Exist"); return; }
     FILE_META_DATA *m=&ALL_FILES.v[i];
     if(strcmp(m->owner, client)!=0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR Not the Owner"); return; }
+
     if(strcmp(flag,"-R")==0)      sl_add_unique(&m->rd, user);
-    else if(strcmp(flag,"-W")==0) sl_add_unique(&m->wr, user);
-    else { pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR incorrect Flags"); return; }
+    else                           sl_add_unique(&m->wr, user);
+
     // notify SS to persist access change
     char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "ADDACCESS %s %s %s", flag, fname, user);
     char ss_id[ID_MAX]; strncpy(ss_id, m->ss_id, ID_MAX-1); ss_id[ID_MAX-1]='\0';
@@ -687,6 +715,11 @@ static void handle_remaccess(int cfd, const char *client, const char *fname, con
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
     FILE_META_DATA *m=&ALL_FILES.v[i];
     if(strcmp(m->owner, client)!=0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NOT_OWNER"); return; }
+    if(strcmp(user, m->owner)==0){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd, "Cannot remove your own access");
+        return;
+    }
     sl_remove(&m->rd, user);
     sl_remove(&m->wr, user);
     char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "REMACCESS %s %s", fname, user);
@@ -887,9 +920,17 @@ static void *worker(void *arg_) {
                 close(fd); return NULL;
             }
             if (strcasecmp(verb,"ADDACCESS")==0) {
-                char flag[8]={0}, fname[FNAME_MAX]={0}, user[ID_MAX]={0};
-                if (sscanf(payload, "ADDACCESS %7s %255s %63s", flag, fname, user)==3)
-                    handle_addaccess(fd, client_id, flag, fname, user);
+                    char args[LINE_MAX];
+                strncpy(args, payload, sizeof(args));
+                args[sizeof(args)-1] = '\0';
+                char *save = NULL;
+                char *tok = strtok_r(args, " \t\r\n", &save); // ADDACCESS
+                char *flag_tok = strtok_r(NULL, " \t\r\n", &save);
+                char *fname_tok = strtok_r(NULL, " \t\r\n", &save);
+                char *user_tok = strtok_r(NULL, " \t\r\n", &save);
+                char *extra_tok = strtok_r(NULL, " \t\r\n", &save);
+                if(tok && flag_tok && fname_tok && user_tok && !extra_tok)
+                    handle_addaccess(fd, client_id, flag_tok, fname_tok, user_tok);
                 else send_line(fd,"ERROR BAD_ADDACCESS");
                 close(fd); return NULL;
             }

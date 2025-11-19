@@ -496,14 +496,14 @@ static void register_ss(const char *id, int client_port, const char *peer_ip) {
         g_ss[idx].client_port = client_port;
         if(g_ss[idx].heap_index==-1) heap_insert(idx);
         pthread_mutex_unlock(&g_mtx);
-        printf("[NM] updated storage server %s at %s:%d (files=%d)\n",
+        printf("[NM] Storage server registered SSid: %s at port %s:%d (no_of_files=%d)\n",
                id, peer_ip, client_port, g_ss[idx].file_count);
         fflush(stdout);
         return;
     }
     if (g_ss_count >= MAX_SS) {
         pthread_mutex_unlock(&g_mtx);
-        fprintf(stderr, "[NM] registry full; cannot register %s\n", id);
+        fprintf(stderr, "[NM] ERROR could not register SSid: %s as registry is full;\n", id);
         return;
     }
     SSInfo *s = &g_ss[g_ss_count];
@@ -517,7 +517,7 @@ static void register_ss(const char *id, int client_port, const char *peer_ip) {
     heap_insert(g_ss_count);
     g_ss_count++;
     pthread_mutex_unlock(&g_mtx);
-    printf("[NM] registered storage server %s at %s:%d (total=%d)\n",
+    printf("[NM] Storage server registered SSid: %s at port %s:%d (no_of_files=%d)\n",
            id, peer_ip, client_port, g_ss_count);
     fflush(stdout);
 }
@@ -549,10 +549,10 @@ static void send_one_line_to_ss(const char *ss_id, const char *client_id, const 
     SSInfo ss; memset(&ss,0,sizeof(ss));
     if(sidx>=0) ss = g_ss[sidx];
     pthread_mutex_unlock(&g_mtx);
-    if(sidx<0){ send_line(client_fd_for_echo, "ERROR STORAGE_SERVER_NOT_FOUND %s", ss_id); return; }
+    if(sidx<0){ send_line(client_fd_for_echo, "ERROR Storage Server Not Fount %s", ss_id); return; }
 
     int ssfd = connect_to_host(ss.ip, ss.client_port);
-    if(ssfd<0){ send_line(client_fd_for_echo, "ERROR CONNECT_SS_FAILED %s", ss_id); return; }
+    if(ssfd<0){ send_line(client_fd_for_echo, "ERROR Connection failed to Storage Server %s", ss_id); return; }
 
     // forward single line
     send_line(ssfd, "HELLO %s %s", client_id, payload);
@@ -624,18 +624,18 @@ static void handle_list_users(int cfd){
 }
 
 static void handle_create(int cfd, const char *client, const char *fname){
-    if(!fname || !*fname){ send_line(cfd,"ERROR BAD_CREATE"); return; }
+    if(!fname || !*fname){ send_line(cfd,"ERROR Create failed: Check File Name"); return; }
 
     pthread_mutex_lock(&g_mtx);
     if(fv_find(&ALL_FILES, fname)>=0){
         pthread_mutex_unlock(&g_mtx);
-        send_line(cfd, "ERROR FILE_EXISTS");
+        send_line(cfd, "ERROR Create failed as file already exists");
         return;
     }
     int sidx = heap_top();
     if(sidx<0){
         pthread_mutex_unlock(&g_mtx);
-        send_line(cfd, "ERROR NO_STORAGE_SERVERS");
+        send_line(cfd, "ERROR Error no Storage server exists");
         return;
     }
     // Grow metadata tables if needed, then create entry
@@ -656,7 +656,7 @@ static void handle_create(int cfd, const char *client, const char *fname){
     SSInfo ss = g_ss[sidx];
     pthread_mutex_unlock(&g_mtx);
 
-    send_line(cfd, "OK CREATED %s on %s:%d (ss=%s)", fname, ss.ip, ss.client_port, ss.id);
+    send_line(cfd, "Create successful CREATED %s on SSId: %s:%d (ss=%s)", fname, ss.ip, ss.client_port, ss.id);
 
     // notify SS (single line)
     char payload[LINE_MAX];
@@ -665,20 +665,20 @@ static void handle_create(int cfd, const char *client, const char *fname){
 }
 
 static void handle_addaccess(int cfd, const char *client, const char *flag, const char *fname, const char *user){
-    if(!flag || !fname || !user){ send_line(cfd,"ERROR BAD_ADDACCESS"); return; }
+    if(!flag || !fname || !user){ send_line(cfd,"ERROR You dont have access"); return; }
     pthread_mutex_lock(&g_mtx);
     int i = fv_find(&ALL_FILES, fname);
-    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR File Doesnt Exist"); return; }
     FILE_META_DATA *m=&ALL_FILES.v[i];
-    if(strcmp(m->owner, client)!=0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NOT_OWNER"); return; }
+    if(strcmp(m->owner, client)!=0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR Not the Owner"); return; }
     if(strcmp(flag,"-R")==0)      sl_add_unique(&m->rd, user);
     else if(strcmp(flag,"-W")==0) sl_add_unique(&m->wr, user);
-    else { pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR BAD_FLAG"); return; }
+    else { pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR incorrect Flags"); return; }
     // notify SS to persist access change
     char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "ADDACCESS %s %s %s", flag, fname, user);
     char ss_id[ID_MAX]; strncpy(ss_id, m->ss_id, ID_MAX-1); ss_id[ID_MAX-1]='\0';
     pthread_mutex_unlock(&g_mtx);
-    send_line(cfd, "OK ADDACCESS %s %s %s", flag, fname, user);
+    send_line(cfd, "OK Access Added succesfully %s %s %s", flag, fname, user);
     send_one_line_to_ss(ss_id, client, payload, cfd);
 }
 
@@ -702,11 +702,11 @@ static void handle_delete(int cfd, const char *client, const char *fname){
     // printf("Going to delete\n");
     pthread_mutex_lock(&g_mtx);
     int i = fv_find(&ALL_FILES, fname);
-    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR File Doesnot exist"); return; }
     FILE_META_DATA m = ALL_FILES.v[i]; // copy
     if(strcmp(m.owner, client)!=0){
         pthread_mutex_unlock(&g_mtx);
-        send_line(cfd,"ERROR NOT_OWNER");
+        send_line(cfd,"ERROR Not the Owner");
         return;
     }
     fv_remove_at(&ALL_FILES, i);
@@ -714,20 +714,20 @@ static void handle_delete(int cfd, const char *client, const char *fname){
 
     ss_decrease_load(m.ss_id);
 
-    send_line(cfd, "OK DELETED %s", fname);
+    send_line(cfd, "OK Deleted Successfully %s", fname);
     
     // notify SS
     char payload[LINE_MAX]; snprintf(payload,sizeof(payload),"DELETE %s", fname);
     send_one_line_to_ss(m.ss_id, client, payload, cfd);
 }
 static void handle_read(int cfd, const char *client, const char *fname, const char *sentence_opt){
-    if(!fname || !*fname){ send_line(cfd,"ERROR BAD_READ"); return; }
+    if(!fname || !*fname){ send_line(cfd,"Read was unsuccessful"); return; }
 
     pthread_mutex_lock(&g_mtx);
     int i = fv_find(&ALL_FILES, fname);
     if(i < 0){
         pthread_mutex_unlock(&g_mtx);
-        send_line(cfd,"ERROR NO_SUCH_FILE");
+        send_line(cfd,"ERROR File Doesnot Exist");
         return;
     }
     FILE_META_DATA *m = &ALL_FILES.v[i];
@@ -736,12 +736,12 @@ static void handle_read(int cfd, const char *client, const char *fname, const ch
     SSInfo ss_ref;
     if(!ok){
         pthread_mutex_unlock(&g_mtx);
-        send_line(cfd,"ERROR PERMISSION_DENIED");
+        send_line(cfd,"ERROR Permission Denied");
         return;
     }
     if(sidx < 0){
         pthread_mutex_unlock(&g_mtx);
-        send_line(cfd,"ERROR STORAGE_SERVER_NOT_FOUND %s", m->ss_id);
+        send_line(cfd,"ERROR Storage Server Not Found %s", m->ss_id);
         return;
     }
     ss_ref = g_ss[sidx];
@@ -1123,7 +1123,7 @@ int main(void) {
     file_cache_init(&FILE_CACHE);
 
     int listen_fd = create_listen_socket(NM_PORT);
-    printf("[NM] listening on port %d\n", NM_PORT); fflush(stdout);
+    printf("Named server has started on port %d\n", NM_PORT); fflush(stdout);
 
     while (1) {
         struct sockaddr_in cli; socklen_t clilen = sizeof(cli);

@@ -598,14 +598,14 @@ static void print_file_long(int fd, const FILE_META_DATA *m){
 // ----------------------- command handling -----------------------
 static void handle_view(int cfd, const char *client, const char *flag){
     pthread_mutex_lock(&g_mtx);
+    bool allv = false;
+    bool longv = false;
     bool all      = (flag && strcmp(flag,"-a")==0);
-    bool longlist = (flag && (strcmp(flag,"-l")==0 || strcmp(flag,"-al")==0));
-    if(flag && strcmp(flag,"-al")==0){ all=true; longlist=true; }
-
+    bool longlist = (flag && (strcmp(flag,"-l")==0 || strcmp(flag,"-al")==0) || stcmp(flag,"-la")==0);
+    if(flag && (strcmp(flag,"-al")==0 || strcmp(flag,"-la")==0)){ all=true; longlist=true; }
     if(!flag || longlist) {
         send_line(cfd, "VIEW results:");
     }
-
     for(int i=0;i<ALL_FILES.n;i++){
         FILE_META_DATA *m=&ALL_FILES.v[i];
         bool visible = all || has_read(m,client) || has_write(m,client) || has_exec(m,client) || strcmp(m->owner,client)==0;
@@ -670,6 +670,7 @@ static void handle_addaccess(int cfd, const char *client, const char *flag, cons
     int i = fv_find(&ALL_FILES, fname);
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
     FILE_META_DATA *m=&ALL_FILES.v[i];
+    if(strcmp(m->owner, client)!=0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NOT_OWNER"); return; }
     if(strcmp(flag,"-R")==0)      sl_add_unique(&m->rd, user);
     else if(strcmp(flag,"-W")==0) sl_add_unique(&m->wr, user);
     else { pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR BAD_FLAG"); return; }
@@ -687,6 +688,7 @@ static void handle_remaccess(int cfd, const char *client, const char *fname, con
     int i = fv_find(&ALL_FILES, fname);
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
     FILE_META_DATA *m=&ALL_FILES.v[i];
+    if(strcmp(m->owner, client)!=0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NOT_OWNER"); return; }
     sl_remove(&m->rd, user);
     sl_remove(&m->wr, user);
     char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "REMACCESS %s %s", fname, user);

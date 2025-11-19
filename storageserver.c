@@ -358,175 +358,152 @@ static void send_stop_packet(int fd, const char *verb, const char *fname) {
     dprintf(fd, "STOP %s %s\n", verb, name);
 }
 
-typedef struct {
-    char **data;
-    size_t count;
-    size_t capacity;
-} WordArray;
+typedef struct WordNode {
+    char *data;
+    struct WordNode *next;
+    struct WordNode *prev;
+} WordNode;
+
+typedef struct SentenceNode {
+    WordNode *words_head;
+    WordNode *words_tail;
+    struct SentenceNode *next;
+    struct SentenceNode *prev;
+    bool locked;
+    char locked_by[ID_MAX];
+} SentenceNode;
 
 typedef struct {
-    WordArray words;
-    char *tail;
-} Sentence;
-
-typedef struct {
-    Sentence *items;
+    char filename[ID_MAX];
+    SentenceNode *head;
+    SentenceNode *tail;
     size_t count;
-    size_t capacity;
+    int ref_count;
 } Document;
 
 typedef struct {
     bool in_use;
     char client_id[ID_MAX];
     char filename[ID_MAX];
-    int sentence_index;
+    Document *doc;
+    SentenceNode *target;
+    SentenceNode *draft_head;
+    SentenceNode *draft_tail;
     mode_t original_mode;
-    Document doc;
 } WriteSession;
 
-static WordArray *word_array_init(WordArray *wa) {
-    wa->data = NULL;
-    wa->count = 0;
-    wa->capacity = 0;
-    return wa;
+static Document *get_document(const char *filename);
+static void invalidate_document(const char *filename);
+
+static WordNode *word_new(const char *text) {
+    WordNode *w = malloc(sizeof(WordNode));
+    if (!w) return NULL;
+    w->data = strdup(text);
+    w->next = w->prev = NULL;
+    return w;
 }
 
-static void word_array_free(WordArray *wa) {
-    if (!wa) return;
-    for (size_t i = 0; i < wa->count; ++i) {
-        free(wa->data[i]);
-    }
-    free(wa->data);
-    wa->data = NULL;
-    wa->count = 0;
-    wa->capacity = 0;
+static void word_free(WordNode *w) {
+    if (!w) return;
+    free(w->data);
+    free(w);
 }
 
-static int word_array_reserve(WordArray *wa, size_t needed) {
-    if (wa->capacity >= needed) {
-        return 0;
-    }
-    size_t new_cap = wa->capacity ? wa->capacity * 2 : 8;
-    while (new_cap < needed) new_cap *= 2;
-    char **tmp = realloc(wa->data, new_cap * sizeof(*tmp));
-    if (!tmp) return -1;
-    wa->data = tmp;
-    wa->capacity = new_cap;
-    return 0;
-}
-
-static int word_array_append_slice(WordArray *wa, const char *start, size_t len) {
-    if (word_array_reserve(wa, wa->count + 1) < 0) return -1;
-    char *dup = strndup(start, len);
-    if (!dup) return -1;
-    wa->data[wa->count++] = dup;
-    return 0;
-}
-
-static int word_array_append_string(WordArray *wa, const char *value) {
-    return word_array_append_slice(wa, value, strlen(value));
-}
-
-static int word_array_replace(WordArray *wa, size_t index, const char *value) {
-    if (index >= wa->count) {
-        errno = EINVAL;
-        return -1;
-    }
-    char *dup = strdup(value);
-    if (!dup) return -1;
-    free(wa->data[index]);
-    wa->data[index] = dup;
-    return 0;
-}
-
-static int sentence_init(Sentence *s) {
-    if (!s) return -1;
-    word_array_init(&s->words);
-    s->tail = strdup("");
-    if (!s->tail) return -1;
-    return 0;
-}
-
-static void sentence_free(Sentence *s) {
-    if (!s) return;
-    word_array_free(&s->words);
-    free(s->tail);
-    s->tail = NULL;
-}
-
-static int sentence_set_tail(Sentence *s, const char *start, size_t len) {
-    char *dup = strndup(start, len);
-    if (!dup) return -1;
-    free(s->tail);
-    s->tail = dup;
-    return 0;
-}
-
-static void document_init(Document *doc) {
-    doc->items = NULL;
-    doc->count = 0;
-    doc->capacity = 0;
-}
-
-static void document_free(Document *doc) {
-    if (!doc) return;
-    for (size_t i = 0; i < doc->count; ++i) {
-        sentence_free(&doc->items[i]);
-    }
-    free(doc->items);
-    doc->items = NULL;
-    doc->count = 0;
-    doc->capacity = 0;
-}
-
-static Sentence *document_new_sentence(Document *doc) {
-    if (doc->count == doc->capacity) {
-        size_t new_cap = doc->capacity ? doc->capacity * 2 : 8;
-        Sentence *tmp = realloc(doc->items, new_cap * sizeof(*tmp));
-        if (!tmp) return NULL;
-        doc->items = tmp;
-        doc->capacity = new_cap;
-    }
-    Sentence *s = &doc->items[doc->count];
-    if (sentence_init(s) < 0) return NULL;
-    doc->count++;
+static SentenceNode *sentence_new(void) {
+    SentenceNode *s = malloc(sizeof(SentenceNode));
+    if (!s) return NULL;
+    s->words_head = s->words_tail = NULL;
+    s->next = s->prev = NULL;
+    s->locked = false;
+    s->locked_by[0] = '\0';
     return s;
 }
 
+static void sentence_append_word(SentenceNode *s, const char *text) {
+    WordNode *w = word_new(text);
+    if (!w) return;
+    if (!s->words_head) {
+        s->words_head = s->words_tail = w;
+    } else {
+        s->words_tail->next = w;
+        w->prev = s->words_tail;
+        s->words_tail = w;
+    }
+}
+
+static void sentence_free(SentenceNode *s) {
+    if (!s) return;
+    WordNode *cur = s->words_head;
+    while (cur) {
+        WordNode *next = cur->next;
+        word_free(cur);
+        cur = next;
+    }
+    free(s);
+}
+
+static void document_init(Document *doc, const char *filename) {
+    strncpy(doc->filename, filename, ID_MAX-1);
+    doc->filename[ID_MAX-1] = '\0';
+    doc->head = doc->tail = NULL;
+    doc->count = 0;
+    doc->ref_count = 0;
+}
+
+static void document_append_sentence(Document *doc, SentenceNode *s) {
+    if (!doc->head) {
+        doc->head = doc->tail = s;
+    } else {
+        doc->tail->next = s;
+        s->prev = doc->tail;
+        doc->tail = s;
+    }
+    doc->count++;
+}
+
+static void document_free_content(Document *doc) {
+    SentenceNode *cur = doc->head;
+    while (cur) {
+        SentenceNode *next = cur->next;
+        sentence_free(cur);
+        cur = next;
+    }
+    doc->head = doc->tail = NULL;
+    doc->count = 0;
+}
+
+static SentenceNode *sentence_copy(SentenceNode *src) {
+    SentenceNode *dst = sentence_new();
+    WordNode *cur = src->words_head;
+    while (cur) {
+        sentence_append_word(dst, cur->data);
+        cur = cur->next;
+    }
+    return dst;
+}
+
 static bool is_sentence_delimiter(char c) {
-    return c == '.' || c == '!' || c == '?' || c == '\n' || c == '\r';
+    return c == '.' || c == '!' || c == '?' || c == '\n';
 }
 
 static int document_parse_from_path(const char *path, Document *doc, mode_t *mode_out) {
-    document_init(doc);
+    document_init(doc, path);
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
 
     struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        return -1;
-    }
+    if (fstat(fd, &st) < 0) { close(fd); return -1; }
     if (mode_out) *mode_out = st.st_mode;
 
     size_t size = (size_t)st.st_size;
     char *buffer = malloc(size + 1);
-    if (!buffer) {
-        close(fd);
-        errno = ENOMEM;
-        return -1;
-    }
+    if (!buffer) { close(fd); return -1; }
 
     size_t off = 0;
     while (off < size) {
         ssize_t r = read(fd, buffer + off, size - off);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            free(buffer);
-            close(fd);
-            return -1;
-        }
+        if (r < 0) { if (errno == EINTR) continue; free(buffer); close(fd); return -1; }
         if (r == 0) break;
         off += (size_t)r;
     }
@@ -534,105 +511,103 @@ static int document_parse_from_path(const char *path, Document *doc, mode_t *mod
     buffer[off] = '\0';
     close(fd);
 
-    Sentence *current = NULL;
+    SentenceNode *current = NULL;
     size_t word_start = (size_t)-1;
+    bool skip_newline = false;
 
     for (size_t i = 0; i <= size; ++i) {
         char c = (i < size) ? buffer[i] : '\0';
         bool at_end = (i == size);
-    bool delim = (!at_end && is_sentence_delimiter(c));
-    bool space = (!at_end && isspace((unsigned char)c) && c != '\n' && c != '\r');
+        
+        bool is_punct = (c == '.' || c == '!' || c == '?');
+        bool is_newline = (c == '\n');
+        bool is_space = isspace((unsigned char)c) && !is_newline;
 
-        if (word_start == (size_t)-1) {
-            if (!at_end && !delim && !space) {
-                if (!current) {
-                    current = document_new_sentence(doc);
+        if (is_punct) {
+            // Punctuation is a delimiter.
+            // Add preceding word if any.
+            if (word_start != (size_t)-1) {
+                size_t len = i - word_start;
+                char *w = malloc(len + 2);
+                memcpy(w, buffer + word_start, len);
+                w[len] = c; w[len+1] = '\0';
+                if (!current) { current = sentence_new(); document_append_sentence(doc, current); }
+                sentence_append_word(current, w);
+                free(w);
+                word_start = (size_t)-1;
+            } else {
+                // Punctuation standing alone (or after space)
+                char w[2] = {c, '\0'};
+                if (!current) { current = sentence_new(); document_append_sentence(doc, current); }
+                sentence_append_word(current, w);
+            }
+            current = NULL; // End sentence
+            skip_newline = true; // Expect a newline to follow, which we should ignore as it's just formatting
+        } else if (is_newline) {
+            if (skip_newline) {
+                skip_newline = false;
+                // Ignore this newline
+            } else {
+                // Newline is a delimiter here (e.g. Title\n or blank line)
+                if (word_start != (size_t)-1) {
+                    size_t len = i - word_start;
+                    char *w = strndup(buffer + word_start, len);
+                    if (!current) { current = sentence_new(); document_append_sentence(doc, current); }
+                    sentence_append_word(current, w);
+                    free(w);
+                    word_start = (size_t)-1;
+                } else {
+                    // No pending word.
+                    // If current is NULL, it means we are between sentences.
+                    // This newline creates an empty sentence (blank line).
                     if (!current) {
-                        free(buffer);
-                        document_free(doc);
-                        errno = ENOMEM;
-                        return -1;
+                        current = sentence_new();
+                        document_append_sentence(doc, current);
                     }
                 }
-                word_start = i;
+                current = NULL; // End sentence
+                skip_newline = false;
             }
-        }
-
-        if (word_start != (size_t)-1 && (at_end || delim || space)) {
-            if (!current) {
-                current = document_new_sentence(doc);
-                if (!current) {
-                    free(buffer);
-                    document_free(doc);
-                    errno = ENOMEM;
-                    return -1;
-                }
+        } else if (is_space || at_end) {
+            if (word_start != (size_t)-1) {
+                size_t len = i - word_start;
+                char *w = strndup(buffer + word_start, len);
+                if (!current) { current = sentence_new(); document_append_sentence(doc, current); }
+                sentence_append_word(current, w);
+                free(w);
+                word_start = (size_t)-1;
             }
-            size_t len = i - word_start;
-            if (len > 0) {
-                if (word_array_append_slice(&current->words, buffer + word_start, len) < 0) {
-                    free(buffer);
-                    document_free(doc);
-                    return -1;
-                }
-            }
-            word_start = (size_t)-1;
-        }
-
-        if (delim) {
-            if (!current) {
-                current = document_new_sentence(doc);
-                if (!current) {
-                    free(buffer);
-                    document_free(doc);
-                    errno = ENOMEM;
-                    return -1;
-                }
-            }
-            size_t tail_start = i;
-            size_t j = i + 1;
-            while (j < size && isspace((unsigned char)buffer[j]) && buffer[j] != '\n' && buffer[j] != '\r') ++j;
-            size_t tail_len = j - tail_start;
-            if (sentence_set_tail(current, buffer + tail_start, tail_len) < 0) {
-                free(buffer);
-                document_free(doc);
-                return -1;
-            }
-            current = NULL;
-            i = j - 1;
-        } else if (at_end) {
-            if (current && !current->tail) {
-                current->tail = strdup("");
-            }
-            current = NULL;
+            // Space does NOT reset skip_newline
+        } else {
+            // Normal char
+            if (word_start == (size_t)-1) word_start = i;
+            skip_newline = false;
         }
     }
-
     free(buffer);
     return 0;
 }
 
-static char *sentence_join_words(const Sentence *s) {
-    size_t total = 0;
-    if (s->words.count > 0) {
-        for (size_t i = 0; i < s->words.count; ++i) {
-            total += strlen(s->words.data[i]);
-        }
-        total += (s->words.count - 1);
+static char *sentence_join_words(const SentenceNode *s) {
+    if (!s || !s->words_head) return strdup("");
+    size_t len = 0;
+    WordNode *cur = s->words_head;
+    while (cur) {
+        len += strlen(cur->data);
+        if (cur->next) len++;
+        cur = cur->next;
     }
-    char *out = malloc(total + 1);
-    if (!out) return NULL;
-    char *ptr = out;
-    for (size_t i = 0; i < s->words.count; ++i) {
-        size_t len = strlen(s->words.data[i]);
-        memcpy(ptr, s->words.data[i], len);
-        ptr += len;
-        if (i + 1 < s->words.count) *ptr++ = ' ';
+    char *buf = malloc(len + 1);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+    cur = s->words_head;
+    while (cur) {
+        strcat(buf, cur->data);
+        if (cur->next) strcat(buf, " ");
+        cur = cur->next;
     }
-    *ptr = '\0';
-    return out;
+    return buf;
 }
-
 static int write_all_fd(int fd, const char *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -669,8 +644,8 @@ static int write_document_to_path(const Document *doc, const char *path, mode_t 
         return -1;
     }
 
-    for (size_t i = 0; i < doc->count; ++i) {
-        const Sentence *s = &doc->items[i];
+    SentenceNode *s = doc->head;
+    while (s) {
         char *joined = sentence_join_words(s);
         if (!joined) {
             int saved = errno;
@@ -690,17 +665,20 @@ static int write_document_to_path(const Document *doc, const char *path, mode_t 
                 return -1;
             }
         }
-        free(joined);
-        size_t tail_len = s->tail ? strlen(s->tail) : 0;
-        if (tail_len > 0) {
-            if (write_all_fd(tmp_fd, s->tail, tail_len) < 0) {
+        
+        // Only write newline if the sentence doesn't already end with one
+        if (join_len == 0 || joined[join_len - 1] != '\n') {
+            if (write_all_fd(tmp_fd, "\n", 1) < 0) {
                 int saved = errno;
+                free(joined);
                 close(tmp_fd);
                 unlink(tmp_template);
                 errno = saved;
                 return -1;
             }
         }
+        free(joined);
+        s = s->next;
     }
 
     if (fsync(tmp_fd) < 0) {
@@ -901,7 +879,7 @@ static int copy_file_to_path(const char *src_path, const char *dst_path) {
 static WriteSession g_write_sessions[32];
 
 static WriteSession *session_find_by_client(const char *client_id) {
-    for (size_t i = 0; i < sizeof(g_write_sessions) / sizeof(g_write_sessions[0]); ++i) {
+    for (size_t i = 0; i < 32; ++i) {
         if (g_write_sessions[i].in_use && strcmp(g_write_sessions[i].client_id, client_id) == 0) {
             return &g_write_sessions[i];
         }
@@ -909,26 +887,14 @@ static WriteSession *session_find_by_client(const char *client_id) {
     return NULL;
 }
 
-static WriteSession *session_find_lock(const char *filename, int sentence_index) {
-    for (size_t i = 0; i < sizeof(g_write_sessions) / sizeof(g_write_sessions[0]); ++i) {
-        if (!g_write_sessions[i].in_use) continue;
-        if (g_write_sessions[i].sentence_index == sentence_index &&
-            strcmp(g_write_sessions[i].filename, filename) == 0) {
-            return &g_write_sessions[i];
-        }
-    }
-    return NULL;
-}
-
 static WriteSession *session_allocate(void) {
-    for (size_t i = 0; i < sizeof(g_write_sessions) / sizeof(g_write_sessions[0]); ++i) {
+    for (size_t i = 0; i < 32; ++i) {
         if (!g_write_sessions[i].in_use) {
             g_write_sessions[i].in_use = true;
-            document_init(&g_write_sessions[i].doc);
-            g_write_sessions[i].client_id[0] = '\0';
-            g_write_sessions[i].filename[0] = '\0';
-            g_write_sessions[i].sentence_index = 0;
-            g_write_sessions[i].original_mode = 0;
+            g_write_sessions[i].doc = NULL;
+            g_write_sessions[i].target = NULL;
+            g_write_sessions[i].draft_head = NULL;
+            g_write_sessions[i].draft_tail = NULL;
             return &g_write_sessions[i];
         }
     }
@@ -937,24 +903,24 @@ static WriteSession *session_allocate(void) {
 
 static void session_release(WriteSession *session) {
     if (!session) return;
-    document_free(&session->doc);
+    SentenceNode *cur = session->draft_head;
+    while (cur) {
+        SentenceNode *next = cur->next;
+        sentence_free(cur);
+        cur = next;
+    }
+    if (session->target) {
+        session->target->locked = false;
+        session->target->locked_by[0] = '\0';
+    }
+    if (session->doc) {
+        session->doc->ref_count--;
+    }
     session->in_use = false;
-    session->client_id[0] = '\0';
-    session->filename[0] = '\0';
-    session->sentence_index = 0;
-    session->original_mode = 0;
-}
-
-static Sentence *session_target_sentence(WriteSession *session) {
-    if (!session) return NULL;
-    if (session->sentence_index <= 0) return NULL;
-    size_t idx = (size_t)(session->sentence_index - 1);
-    if (idx >= session->doc.count) return NULL;
-    return &session->doc.items[idx];
 }
 
 static bool file_has_active_session(const char *filename) {
-    for (size_t i = 0; i < sizeof(g_write_sessions) / sizeof(g_write_sessions[0]); ++i) {
+    for (size_t i = 0; i < 32; ++i) {
         if (!g_write_sessions[i].in_use) continue;
         if (strcmp(g_write_sessions[i].filename, filename) == 0) {
             return true;
@@ -971,18 +937,14 @@ static bool is_number_string(const char *s) {
     return true;
 }
 
-static void send_sentence_snapshot(int cfd, const Sentence *sentence) {
+static void send_sentence_snapshot(int cfd, const SentenceNode *sentence) {
     char *joined = sentence_join_words(sentence);
     if (!joined) {
         dprintf(cfd, "SENTENCE ERROR\n");
         return;
     }
     if (joined[0] == '\0') {
-        if (sentence->tail && sentence->tail[0] == '\0') {
-            dprintf(cfd, "SENTENCE (empty)\n");
-        } else {
-            dprintf(cfd, "SENTENCE (blank)\n");
-        }
+        dprintf(cfd, "SENTENCE (empty)\n");
     } else {
         dprintf(cfd, "SENTENCE %s\n", joined);
     }
@@ -994,301 +956,319 @@ static void handle_write_update(int cfd, const char *ss_id, const char *client_i
 static void handle_write_commit(int cfd, const char *ss_id, const char *client_id);
 static void handle_undo(int cfd, const char *ss_id, const char *client_id, const char *arg);
 
-static void handle_write_begin(int cfd, const char *ss_id, const char *client_id, const char *arg) {
-    if (!arg || *arg == '\0') {
-        dprintf(cfd, "ERR WRITE missing_arguments\n");
-        return;
+// Helper to split a word if it contains delimiters
+// Returns true if split happened (and w might be modified/next changed)
+static bool word_check_split(WordNode *w, SentenceNode *s) {
+    if (!w || !w->data) return false;
+    char *p = w->data;
+    size_t len = strlen(p);
+    size_t split_idx = (size_t)-1;
+    
+    for (size_t i = 0; i < len; ++i) {
+        if (is_sentence_delimiter(p[i])) {
+            split_idx = i;
+            break;
+        }
     }
+
+    if (split_idx == (size_t)-1) return false;
+
+    // We have a delimiter at split_idx.
+    // The part including the delimiter stays in w.
+    // The part after the delimiter moves to a new word w_next.
+    
+    // If delimiter is at the very end, we don't need to split the word itself, 
+    // but we need to signal that this word ends the sentence.
+    if (split_idx == len - 1) {
+        return true; // Signal that this word is a terminator
+    }
+
+    // Split "hello.world" -> "hello." and "world"
+    char *first_part = strndup(p, split_idx + 1);
+    char *second_part = strdup(p + split_idx + 1);
+    
+    free(w->data);
+    w->data = first_part;
+    
+    WordNode *new_w = word_new(second_part);
+    free(second_part);
+    
+    new_w->next = w->next;
+    new_w->prev = w;
+    if (w->next) w->next->prev = new_w;
+    w->next = new_w;
+    
+    if (s->words_tail == w) s->words_tail = new_w;
+    
+    return true;
+}
+
+// Normalize sentence: check words for delimiters.
+// If a word ends with a delimiter (or is split to end with one),
+// split the sentence there.
+static void sentence_normalize(Document *doc, SentenceNode *s) {
+    if (!s) return;
+    
+    WordNode *cur = s->words_head;
+    while (cur) {
+        bool is_terminator = word_check_split(cur, s);
+        if (is_terminator) {
+            // cur ends with a delimiter.
+            // All words after cur should move to a new sentence.
+            WordNode *next_word = cur->next;
+            
+            if (next_word) {
+                SentenceNode *new_s = sentence_new();
+                
+                // Move words
+                new_s->words_head = next_word;
+                new_s->words_tail = s->words_tail;
+                
+                next_word->prev = NULL;
+                s->words_tail = cur;
+                cur->next = NULL;
+                
+                // Link sentences
+                new_s->next = s->next;
+                new_s->prev = s;
+                if (s->next) s->next->prev = new_s;
+                s->next = new_s;
+                
+                if (doc->tail == s) doc->tail = new_s;
+                doc->count++;
+                
+                // Continue normalizing the new sentence
+                sentence_normalize(doc, new_s);
+                return;
+            } else {
+                // Delimiter is at the last word.
+                // If there are more sentences following, we are good.
+                // If we just added a delimiter to the end, we might need to ensure
+                // the next thing is a new sentence (which it is, by structure).
+            }
+        }
+        cur = cur->next;
+    }
+}
+
+static void handle_write_begin(int cfd, const char *ss_id, const char *client_id, const char *arg) {
+    if (!arg || *arg == '\0') { dprintf(cfd, "ERR WRITE missing_arguments\n"); return; }
 
     char filename[ID_MAX];
     int sentence_index = 0;
-    if (sscanf(arg, "%63s %d", filename, &sentence_index) != 2) {
-        dprintf(cfd, "ERR WRITE bad_arguments\n");
-        return;
-    }
-    if (!is_valid_name_component(filename)) {
-        dprintf(cfd, "ERR WRITE invalid_filename\n");
-        return;
-    }
-    if (sentence_index <= 0) {
-        dprintf(cfd, "ERR WRITE bad_sentence_index\n");
-        return;
+    if (sscanf(arg, "%63s %d", filename, &sentence_index) != 2) { dprintf(cfd, "ERR WRITE bad_arguments\n"); return; }
+    if (!is_valid_name_component(filename)) { dprintf(cfd, "ERR WRITE invalid_filename\n"); return; }
+    if (sentence_index <= 0) { dprintf(cfd, "ERR WRITE bad_sentence_index\n"); return; }
+
+    if (session_find_by_client(client_id)) { dprintf(cfd, "ERR WRITE already_in_progress\n"); return; }
+
+    Document *doc = get_document(filename);
+    if (!doc) { dprintf(cfd, "ERR WRITE load_failed\n"); return; }
+
+    SentenceNode *target = doc->head;
+    int idx = 1;
+    while (target && idx < sentence_index) {
+        target = target->next;
+        idx++;
     }
 
-    if (session_find_by_client(client_id)) {
-        dprintf(cfd, "ERR WRITE already_in_progress\n");
-        return;
-    }
-
-    WriteSession *locked = session_find_lock(filename, sentence_index);
-    if (locked && strcmp(locked->client_id, client_id) != 0) {
-        dprintf(cfd, "ERR WRITE locked %s %d\n", filename, sentence_index);
-        return;
-    }
-
-    char path[PATH_MAX];
-    if (storage_path_for(filename, path, sizeof(path)) < 0) {
-        dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-        return;
-    }
-
-    Document doc;
-    mode_t mode = 0666;
-    if (document_parse_from_path(path, &doc, &mode) < 0) {
-        dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-        return;
-    }
-
-    if ((size_t)sentence_index == 0) {
-        document_free(&doc);
-        dprintf(cfd, "ERR WRITE sentence_out_of_range\n");
-        return;
-    }
-
-    size_t current_count = doc.count;
-    size_t desired = (size_t)sentence_index;
-    if (desired > current_count + 1) {
-        document_free(&doc);
-        dprintf(cfd, "ERR WRITE sentence_out_of_range\n");
-        return;
-    }
-
-    if (desired == current_count + 1) {
-        Sentence *prev = current_count > 0 ? &doc.items[current_count - 1] : NULL;
-        Sentence *ns = document_new_sentence(&doc);
-        if (!ns) {
-            document_free(&doc);
-            dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
+    if (!target) {
+        if (idx == sentence_index) {
+            // Append new sentence (blank line)
+            target = sentence_new();
+            document_append_sentence(doc, target);
+        } else {
+            dprintf(cfd, "ERR WRITE sentence_out_of_range\n");
             return;
         }
-        if (prev && (!prev->tail || prev->tail[0] == '\0')) {
-            if (sentence_set_tail(prev, "\n", 1) < 0) {
-                document_free(&doc);
-                dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-                return;
-            }
+    }
+
+    if (target->locked) {
+        if (strcmp(target->locked_by, client_id) != 0) {
+            dprintf(cfd, "ERR WRITE locked %s %d\n", filename, sentence_index);
+            return;
         }
     }
 
     WriteSession *session = session_allocate();
-    if (!session) {
-        document_free(&doc);
-        dprintf(cfd, "ERR WRITE too_many_sessions\n");
-        return;
-    }
+    if (!session) { dprintf(cfd, "ERR WRITE too_many_sessions\n"); return; }
+
+    target->locked = true;
+    strncpy(target->locked_by, client_id, ID_MAX-1);
 
     session->doc = doc;
-    strncpy(session->client_id, client_id, sizeof(session->client_id) - 1);
-    session->client_id[sizeof(session->client_id) - 1] = '\0';
-    strncpy(session->filename, filename, sizeof(session->filename) - 1);
-    session->filename[sizeof(session->filename) - 1] = '\0';
-    session->sentence_index = sentence_index;
-    session->original_mode = mode;
+    doc->ref_count++;
+    session->target = target;
+    strncpy(session->client_id, client_id, ID_MAX-1);
+    strncpy(session->filename, filename, ID_MAX-1);
+    
+    // No draft copy needed, we operate on live structure
+    session->draft_head = NULL;
+    session->draft_tail = NULL;
 
-    Sentence *target = session_target_sentence(session);
-    if (!target) {
-        dprintf(cfd, "ERR WRITE internal_error\n");
-        session_release(session);
-        return;
-    }
-
-    dprintf(cfd, "ACK %s WRITE READY %s %d %zu\n", ss_id, filename, sentence_index, target->words.count);
-    send_sentence_snapshot(cfd, target);
+    dprintf(cfd, "ACK %s WRITE READY %s %d\n", ss_id, filename, sentence_index);
+    send_sentence_snapshot(cfd, session->target);
 }
 
 static void handle_write_update(int cfd, const char *ss_id, const char *client_id, const char *index_token, const char *arg) {
-    if (!index_token || !is_number_string(index_token)) {
-        dprintf(cfd, "ERR WRITE bad_word_index\n");
-        return;
-    }
-    if (!arg || *arg == '\0') {
-        dprintf(cfd, "ERR WRITE missing_content\n");
-        return;
-    }
+    if (!index_token || !is_number_string(index_token)) { dprintf(cfd, "ERR WRITE bad_word_index\n"); return; }
+    if (!arg || *arg == '\0') { dprintf(cfd, "ERR WRITE missing_content\n"); return; }
 
     long idx_long = strtol(index_token, NULL, 10);
-    if (idx_long <= 0 || idx_long > INT_MAX) {
-        dprintf(cfd, "ERR WRITE bad_word_index\n");
-        return;
-    }
+    if (idx_long <= 0) { dprintf(cfd, "ERR WRITE bad_word_index\n"); return; }
     int word_index = (int)idx_long;
 
     WriteSession *session = session_find_by_client(client_id);
-    if (!session) {
-        dprintf(cfd, "ERR WRITE no_active_session\n");
-        return;
-    }
+    if (!session) { dprintf(cfd, "ERR WRITE no_active_session\n"); return; }
 
-    Sentence *target = session_target_sentence(session);
-    if (!target) {
-        dprintf(cfd, "ERR WRITE internal_error\n");
-        session_release(session);
-        return;
-    }
+    SentenceNode *s = session->target;
+    if (!s) { dprintf(cfd, "ERR WRITE invalid_session_state\n"); return; }
 
-    if ((size_t)(word_index - 1) < target->words.count) {
-        if (word_array_replace(&target->words, (size_t)(word_index - 1), arg) < 0) {
-            dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-            return;
+    int current_idx = 1;
+    WordNode *w = s->words_head;
+    
+    while (w) {
+        if (current_idx == word_index) {
+            break;
         }
-    } else if ((size_t)word_index == target->words.count + 1) {
-        if (word_array_append_string(&target->words, arg) < 0) {
-            dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
+        w = w->next;
+        current_idx++;
+    }
+    
+    if (!w) {
+        if (current_idx == word_index) {
+            // Append word
+            sentence_append_word(s, arg);
+            w = s->words_tail;
+        } else {
+            dprintf(cfd, "ERR WRITE index_out_of_bounds\n");
             return;
         }
     } else {
-        dprintf(cfd, "ERR WRITE index_out_of_bounds\n");
-        return;
+        // Append to existing word instead of replacing
+        size_t old_len = strlen(w->data);
+        size_t arg_len = strlen(arg);
+        char *new_data = malloc(old_len + arg_len + 1);
+        if (new_data) {
+            strcpy(new_data, w->data);
+            strcat(new_data, arg);
+            free(w->data);
+            w->data = new_data;
+        }
     }
-
-    dprintf(cfd, "ACK %s WRITE UPDATED %s %d %d\n", ss_id, session->filename, session->sentence_index, word_index);
-    send_sentence_snapshot(cfd, target);
+    
+    // Normalize sentence (handle splitting)
+    sentence_normalize(session->doc, s);
+    
+    dprintf(cfd, "ACK %s WRITE UPDATED %s\n", ss_id, session->filename);
+    send_sentence_snapshot(cfd, session->target);
 }
 
 static void handle_write_commit(int cfd, const char *ss_id, const char *client_id) {
     WriteSession *session = session_find_by_client(client_id);
-    if (!session) {
-        dprintf(cfd, "ERR WRITE no_active_session\n");
-        return;
-    }
+    if (!session) { dprintf(cfd, "ERR WRITE no_active_session\n"); return; }
 
-    Sentence *target = session_target_sentence(session);
-    if (!target) {
-        dprintf(cfd, "ERR WRITE internal_error\n");
-        session_release(session);
-        return;
+    Document *doc = session->doc;
+    SentenceNode *target = session->target;
+    
+    // Unlock
+    if (target) {
+        target->locked = false;
+        target->locked_by[0] = '\0';
     }
-
-    if (target->words.count == 0 && (!target->tail || target->tail[0] == '\0')) {
-        if (sentence_set_tail(target, "\n", 1) < 0) {
-            dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-            session_release(session);
-            return;
-        }
-    }
-
+    
+    session->target = NULL;
+    
     char path[PATH_MAX];
-    if (storage_path_for(session->filename, path, sizeof(path)) < 0) {
-        dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-        session_release(session);
-        return;
-    }
-
+    storage_path_for(session->filename, path, sizeof(path));
     char undo_path[PATH_MAX];
-    if (undo_path_for(session->filename, undo_path, sizeof(undo_path)) < 0) {
-        dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-        session_release(session);
-        return;
-    }
-
-    if (copy_file_to_path(path, undo_path) < 0) {
-        if (errno != ENOENT) {
-            dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-            session_release(session);
-            return;
-        }
-    }
-
-    if (write_document_to_path(&session->doc, path, session->original_mode) < 0) {
-        dprintf(cfd, "ERR WRITE %s\n", strerror(errno));
-        session_release(session);
-        return;
-    }
-
-    // update info metadata: last modified and size
+    undo_path_for(session->filename, undo_path, sizeof(undo_path));
+    
+    // Backup current file to undo path
+    copy_file_to_path(path, undo_path);
+    
+    // Save document to disk
+    write_document_to_path(doc, path, 0666);
+    
     char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
     char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
-    load_info_fields(session->filename,
-                     owner, sizeof(owner),
-                     access_str, sizeof(access_str),
-                     created, sizeof(created),
-                     lastmod, sizeof(lastmod),
-                     last_access_ts, sizeof(last_access_ts),
-                     last_access_user, sizeof(last_access_user));
+    load_info_fields(session->filename, owner, sizeof(owner), access_str, sizeof(access_str), created, sizeof(created), lastmod, sizeof(lastmod), last_access_ts, sizeof(last_access_ts), last_access_user, sizeof(last_access_user));
     char now[64]; format_time_now(now, sizeof(now));
-    write_info_txt(session->filename,
-                   owner[0]?owner:NULL,
-                   access_str,
-                   created[0]?created:NULL,
-                   now,
-                   now,
-                   client_id);
+    write_info_txt(session->filename, owner[0]?owner:NULL, access_str, created[0]?created:NULL, now, now, client_id);
 
-    dprintf(cfd, "ACK %s WRITE COMMIT %s %d\n", ss_id, session->filename, session->sentence_index);
-    send_sentence_snapshot(cfd, target);
+    dprintf(cfd, "ACK %s WRITE COMMIT %s\n", ss_id, session->filename);
     session_release(session);
 }
 
 static void handle_undo(int cfd, const char *ss_id, const char *client_id, const char *arg) {
-    (void)client_id;
     char filename[ID_MAX];
-    if (!arg || sscanf(arg, "%63s", filename) != 1) {
-        dprintf(cfd, "ERR UNDO missing_filename\n");
-        return;
-    }
-    if (!is_valid_name_component(filename)) {
-        dprintf(cfd, "ERR UNDO invalid_filename\n");
-        return;
-    }
-
-    if (file_has_active_session(filename)) {
-        dprintf(cfd, "ERR UNDO write_in_progress\n");
-        return;
-    }
+    if (!arg || sscanf(arg, "%63s", filename) != 1) { dprintf(cfd, "ERR UNDO missing_filename\n"); return; }
+    if (!is_valid_name_component(filename)) { dprintf(cfd, "ERR UNDO invalid_filename\n"); return; }
+    if (file_has_active_session(filename)) { dprintf(cfd, "ERR UNDO write_in_progress\n"); return; }
 
     char current_path[PATH_MAX];
-    if (storage_path_for(filename, current_path, sizeof(current_path)) < 0) {
-        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
-        return;
-    }
+    if (storage_path_for(filename, current_path, sizeof(current_path)) < 0) { dprintf(cfd, "ERR UNDO %s\n", strerror(errno)); return; }
     struct stat st;
-    if (stat(current_path, &st) < 0) {
-        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
-        return;
-    }
+    if (stat(current_path, &st) < 0) { dprintf(cfd, "ERR UNDO %s\n", strerror(errno)); return; }
 
     char undo_path[PATH_MAX];
-    if (undo_path_for(filename, undo_path, sizeof(undo_path)) < 0) {
-        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
-        return;
-    }
+    if (undo_path_for(filename, undo_path, sizeof(undo_path)) < 0) { dprintf(cfd, "ERR UNDO %s\n", strerror(errno)); return; }
     if (stat(undo_path, &st) < 0) {
-        if (errno == ENOENT) {
-            dprintf(cfd, "ERR UNDO no_history\n");
-        } else {
-            dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
-        }
+        if (errno == ENOENT) dprintf(cfd, "ERR UNDO no_history\n");
+        else dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
         return;
     }
 
     char swap_path[PATH_MAX];
-    if (swap_path_for(filename, swap_path, sizeof(swap_path)) < 0) {
-        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
-        return;
-    }
+    if (swap_path_for(filename, swap_path, sizeof(swap_path)) < 0) { dprintf(cfd, "ERR UNDO %s\n", strerror(errno)); return; }
 
     unlink(swap_path);
-    if (rename(current_path, swap_path) < 0) {
-        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
-        return;
-    }
+    if (rename(current_path, swap_path) < 0) { dprintf(cfd, "ERR UNDO %s\n", strerror(errno)); return; }
     if (rename(undo_path, current_path) < 0) {
-        int saved = errno;
-        rename(swap_path, current_path);
-        errno = saved;
-        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
-        return;
+        int saved = errno; rename(swap_path, current_path); errno = saved;
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno)); return;
     }
     if (rename(swap_path, undo_path) < 0) {
-        int saved = errno;
-        rename(current_path, undo_path);
-        rename(swap_path, current_path);
-        errno = saved;
-        dprintf(cfd, "ERR UNDO %s\n", strerror(errno));
-        return;
+        int saved = errno; rename(current_path, undo_path); rename(swap_path, current_path); errno = saved;
+        dprintf(cfd, "ERR UNDO %s\n", strerror(errno)); return;
     }
-
+    
+    invalidate_document(filename);
     dprintf(cfd, "ACK %s UNDO OK %s\n", ss_id, filename);
+}
+
+#define MAX_DOCS 64
+static Document *g_docs[MAX_DOCS];
+
+static Document *get_document(const char *filename) {
+    for (int i = 0; i < MAX_DOCS; ++i) {
+        if (g_docs[i] && strcmp(g_docs[i]->filename, filename) == 0) {
+            return g_docs[i];
+        }
+    }
+    for (int i = 0; i < MAX_DOCS; ++i) {
+        if (!g_docs[i]) {
+            Document *doc = malloc(sizeof(Document));
+            if (!doc) return NULL;
+            char path[PATH_MAX];
+            if (storage_path_for(filename, path, sizeof(path)) < 0) { free(doc); return NULL; }
+            if (document_parse_from_path(path, doc, NULL) < 0) { free(doc); return NULL; }
+            g_docs[i] = doc;
+            return doc;
+        }
+    }
+    return NULL;
+}
+
+static void invalidate_document(const char *filename) {
+    for (int i = 0; i < MAX_DOCS; ++i) {
+        if (g_docs[i] && strcmp(g_docs[i]->filename, filename) == 0) {
+            document_free_content(g_docs[i]);
+            free(g_docs[i]);
+            g_docs[i] = NULL;
+            return;
+        }
+    }
 }
 
 int main(void) {

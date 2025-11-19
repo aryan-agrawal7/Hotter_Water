@@ -598,10 +598,8 @@ static void print_file_long(int fd, const FILE_META_DATA *m){
 // ----------------------- command handling -----------------------
 static void handle_view(int cfd, const char *client, const char *flag){
     pthread_mutex_lock(&g_mtx);
-    bool allv = false;
-    bool longv = false;
     bool all      = (flag && strcmp(flag,"-a")==0);
-    bool longlist = (flag && (strcmp(flag,"-l")==0 || strcmp(flag,"-al")==0) || stcmp(flag,"-la")==0);
+    bool longlist = (flag && (strcmp(flag,"-l")==0 || strcmp(flag,"-al")==0 || strcmp(flag,"-la")==0));
     if(flag && (strcmp(flag,"-al")==0 || strcmp(flag,"-la")==0)){ all=true; longlist=true; }
     if(!flag || longlist) {
         send_line(cfd, "VIEW results:");

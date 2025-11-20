@@ -1691,7 +1691,7 @@ int main(void) {
                                 strcat(new_access, user);
                                 strcat(new_access, " (");
                                 if(strcmp(flag, "-R")==0) strcat(new_access, "R");
-                                else if(strcmp(flag, "-W")==0) strcat(new_access, "RW");
+                                else if(strcmp(flag, "-W")==0) strcat(new_access, "W");
                                 else strcat(new_access, "RW");
                                 strcat(new_access, ")");
                             }

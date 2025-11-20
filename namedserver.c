@@ -909,6 +909,19 @@ static void *worker(void *arg_) {
         close(fd); return NULL;
     }
 
+    if (strncmp(first, "SS_LOG_FILES", 12) == 0) {
+        char ss_id[ID_MAX];
+        char files[LINE_MAX];
+        if (sscanf(first, "SS_LOG_FILES %63s %4095[^\n]", ss_id, files) == 2) {
+             log_message("INFO", "Storage Server %s restarted. Found existing files: %s", ss_id, files);
+             send_line(fd, "OK");
+        } else {
+             log_message("WARN", "Received malformed SS_LOG_FILES");
+             send_line(fd, "ERROR malformed SS_LOG_FILES");
+        }
+        close(fd); return NULL;
+    }
+
     if (strncmp(first, "HELLOCLIENT", 11) == 0) {
         char client_id[ID_MAX]={0};
         if (sscanf(first, "HELLOCLIENT %63s", client_id) == 1) {

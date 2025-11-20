@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
+#include <dirent.h>
 #include <stdarg.h>
 
 #define NM_IP   "127.0.0.1"
@@ -46,6 +47,48 @@ static int ensure_file_container(const char *name);
 static int storage_path_for(const char *name, char *out, size_t out_sz);
 static int undo_path_for(const char *name, char *out, size_t out_sz);
 static int swap_path_for(const char *name, char *out, size_t out_sz);
+static int connect_to_nm(const char *ip, int port);
+static ssize_t read_line(int fd, char *buf, size_t maxlen);
+
+static void send_existing_files_to_nm(const char *ss_id) {
+    DIR *d = opendir(g_storage_dir);
+    if (!d) return;
+
+    char file_list[4096] = {0};
+    struct dirent *dir;
+    bool first = true;
+    int count = 0;
+
+    while ((dir = readdir(d)) != NULL) {
+        if (strcmp(dir->d_name, ".") == 0 || strcmp(dir->d_name, "..") == 0) continue;
+        
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", g_storage_dir, dir->d_name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (!first) {
+                strncat(file_list, ", ", sizeof(file_list) - strlen(file_list) - 1);
+            }
+            strncat(file_list, dir->d_name, sizeof(file_list) - strlen(file_list) - 1);
+            first = false;
+            count++;
+        }
+    }
+    closedir(d);
+
+    if (count > 0) {
+        int nmfd = connect_to_nm(NM_IP, NM_PORT);
+        if (nmfd >= 0) {
+            dprintf(nmfd, "SS_LOG_FILES %s %s\n", ss_id, file_list);
+            char resp[LINE_MAX];
+            read_line(nmfd, resp, sizeof(resp)); // Wait for ack
+            close(nmfd);
+            log_message("INFO", "[SS %s] Informed NM about %d existing files: %s", ss_id, count, file_list);
+        }
+    } else {
+        log_message("INFO", "[SS %s] No existing files found to report.", ss_id);
+    }
+}
 
 static int create_listen_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1383,6 +1426,8 @@ int main(void) {
     char resp[LINE_MAX]; read_line(nmfd, resp, sizeof(resp));
     log_message("INFO", "[SS %s] Named Server response: %s", ss_id, resp);
     close(nmfd);
+
+    send_existing_files_to_nm(ss_id);
 
     // Accept clients and print debug on connect
     while (1) {

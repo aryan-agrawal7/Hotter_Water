@@ -551,7 +551,7 @@ static void get_peer_ip(int fd, char out_ip[IP_MAX]) {
     struct sockaddr_in addr; socklen_t len = sizeof(addr);
     if (getpeername(fd, (struct sockaddr*)&addr, &len) == 0) {
         inet_ntop(AF_INET, &addr.sin_addr, out_ip, IP_MAX);
-    } else { strncpy(out_ip, "127.0.0.1", IP_MAX); }
+    } else { strncpy(out_ip, "0.0.0.0", IP_MAX); }
 }
 static int connect_to_host(const char *ip, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -737,6 +737,59 @@ static void handle_list_users(int cfd){
     pthread_mutex_unlock(&g_mtx);
 }
 
+typedef struct {
+    int index;
+    int file_count;
+} SSCandidate;
+
+static int compare_candidates(const void *a, const void *b) {
+    const SSCandidate *ca = (const SSCandidate *)a;
+    const SSCandidate *cb = (const SSCandidate *)b;
+    return ca->file_count - cb->file_count;
+}
+
+static bool try_create_on_ss(const char *ss_id, const char *client_id, const char *fname, char *out_resp, size_t resp_sz) {
+    SSInfo ss;
+    bool found = false;
+    pthread_mutex_lock(&g_mtx);
+    int idx = ss_find_index(ss_id);
+    if (idx >= 0) {
+        ss = g_ss[idx];
+        found = true;
+    }
+    pthread_mutex_unlock(&g_mtx);
+
+    if (!found) return false;
+
+    int fd = connect_to_host(ss.ip, ss.client_port);
+    if (fd < 0) return false;
+
+    // Set timeout of 15 seconds
+    struct timeval tv;
+    tv.tv_sec = 15;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+    // Send command: HELLO <client_id> CREATE <fname> <client_id>
+    dprintf(fd, "HELLO %s CREATE %s %s\n", client_id, fname, client_id);
+
+    char buf[LINE_MAX];
+    ssize_t n = read_line(fd, buf, sizeof(buf));
+    close(fd);
+
+    if (n <= 0) return false; // Timeout or error
+    
+    if (out_resp) {
+        strncpy(out_resp, buf, resp_sz-1);
+        out_resp[resp_sz-1] = '\0';
+    }
+
+    // Check for ACK
+    if (strncmp(buf, "ACK", 3) == 0) return true;
+    
+    return false;
+}
+
 static void handle_create(int cfd, const char *client, const char *fname){
     log_message("INFO", "Client %s requested CREATE %s", client, fname);
     if(!fname || !*fname){ send_line(cfd,"ERROR Create failed: Check File Name"); return; }
@@ -748,38 +801,84 @@ static void handle_create(int cfd, const char *client, const char *fname){
         send_line(cfd, "ERROR Create failed as file already exists");
         return;
     }
-    int sidx = heap_top();
-    if(sidx<0){
-        pthread_mutex_unlock(&g_mtx);
+    
+    // Collect candidates
+    int count = 0;
+    SSCandidate candidates[MAX_SS];
+    for(int i=0; i<g_ss_count; i++) {
+        if(g_ss[i].in_use) {
+            candidates[count].index = i;
+            candidates[count].file_count = g_ss[i].file_count;
+            count++;
+        }
+    }
+    pthread_mutex_unlock(&g_mtx);
+
+    if (count == 0) {
         log_message("ERROR", "CREATE failed: no storage servers available");
         send_line(cfd, "ERROR Error no Storage server exists");
         return;
     }
-    // Grow metadata tables if needed, then create entry
-    ensure_file_capacity();
-    FILE_META_DATA *m = fv_add(&ALL_FILES);
-    strncpy(m->filename, fname, FNAME_MAX-1);
-    strncpy(m->ss_id,    g_ss[sidx].id, ID_MAX-1);
-    strncpy(m->owner,    client, ID_MAX-1);
-    sl_add_unique(&m->rd, client);
-    sl_add_unique(&m->wr, client);
-    sl_add_unique(&m->ex, client);
-    int new_index = ALL_FILES.n - 1;
-    file_map_set(&FILE_MAP, m->filename, new_index);
-    file_cache_insert(&FILE_CACHE, m->filename, new_index);
-    // Update heap load
-    g_ss[sidx].file_count++;
-    heap_update(sidx);
-    SSInfo ss = g_ss[sidx];
-    pthread_mutex_unlock(&g_mtx);
 
-    log_message("INFO", "Creating file %s on SS %s (%s:%d)", fname, ss.id, ss.ip, ss.client_port);
-    send_line(cfd, "Create successful CREATED %s on SSId: %s:%d (ss=%s)", fname, ss.ip, ss.client_port, ss.id);
+    qsort(candidates, count, sizeof(SSCandidate), compare_candidates);
 
-    // notify SS (single line)
-    char payload[LINE_MAX];
-    snprintf(payload,sizeof(payload), "CREATE %s %s", fname, client);
-    send_one_line_to_ss(ss.id, client, payload, cfd);
+    int success_idx = -1;
+    char ss_resp[LINE_MAX] = {0};
+
+    for(int i=0; i<count; i++) {
+        int idx = candidates[i].index;
+        char try_ssid[ID_MAX];
+        
+        pthread_mutex_lock(&g_mtx);
+        if (g_ss[idx].in_use) {
+             strncpy(try_ssid, g_ss[idx].id, ID_MAX-1); try_ssid[ID_MAX-1]='\0';
+        } else {
+             pthread_mutex_unlock(&g_mtx);
+             continue;
+        }
+        pthread_mutex_unlock(&g_mtx);
+
+        if (try_create_on_ss(try_ssid, client, fname, ss_resp, sizeof(ss_resp))) {
+            success_idx = idx;
+            break;
+        } else {
+            log_message("WARN", "Failed to create file %s on SS %s, trying next...", fname, try_ssid);
+        }
+    }
+
+    if (success_idx >= 0) {
+        pthread_mutex_lock(&g_mtx);
+        // Re-check if file exists (race condition)
+        if(fv_find(&ALL_FILES, fname)>=0){
+             pthread_mutex_unlock(&g_mtx);
+             send_line(cfd, "ERROR Create failed as file already exists (race)");
+             return;
+        }
+        
+        ensure_file_capacity();
+        FILE_META_DATA *m = fv_add(&ALL_FILES);
+        strncpy(m->filename, fname, FNAME_MAX-1);
+        strncpy(m->ss_id,    g_ss[success_idx].id, ID_MAX-1);
+        strncpy(m->owner,    client, ID_MAX-1);
+        sl_add_unique(&m->rd, client);
+        sl_add_unique(&m->wr, client);
+        sl_add_unique(&m->ex, client);
+        int new_index = ALL_FILES.n - 1;
+        file_map_set(&FILE_MAP, m->filename, new_index);
+        file_cache_insert(&FILE_CACHE, m->filename, new_index);
+        
+        g_ss[success_idx].file_count++;
+        heap_update(success_idx);
+        SSInfo ss = g_ss[success_idx];
+        pthread_mutex_unlock(&g_mtx);
+
+        log_message("INFO", "Creating file %s on SS %s (%s:%d)", fname, ss.id, ss.ip, ss.client_port);
+        send_line(cfd, "Create successful CREATED %s on SSId: %s:%d (ss=%s)", fname, ss.ip, ss.client_port, ss.id);
+        if (ss_resp[0]) send_line(cfd, "%s", ss_resp);
+    } else {
+        log_message("ERROR", "CREATE failed: all storage servers failed to respond");
+        send_line(cfd, "ERROR Create failed: all storage servers failed to respond");
+    }
 }
 
 static void handle_addaccess(int cfd, const char *client, const char *flag, const char *fname, const char *user){

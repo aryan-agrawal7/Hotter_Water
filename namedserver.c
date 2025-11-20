@@ -692,6 +692,7 @@ static void handle_addaccess(int cfd, const char *client, const char *flag, cons
     }
 
     pthread_mutex_lock(&g_mtx);
+    if(!sl_contains(&USER_LIST, user)){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR User Doesnt Exist"); return; }
     int i = fv_find(&ALL_FILES, fname);
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR File Doesnt Exist"); return; }
     FILE_META_DATA *m=&ALL_FILES.v[i];
@@ -711,6 +712,7 @@ static void handle_addaccess(int cfd, const char *client, const char *flag, cons
 static void handle_remaccess(int cfd, const char *client, const char *fname, const char *user){
     if(!fname || !user){ send_line(cfd,"ERROR BAD_REMACCESS"); return; }
     pthread_mutex_lock(&g_mtx);
+    if(!sl_contains(&USER_LIST, user)){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR User Doesnt Exist"); return; }
     int i = fv_find(&ALL_FILES, fname);
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
     FILE_META_DATA *m=&ALL_FILES.v[i];

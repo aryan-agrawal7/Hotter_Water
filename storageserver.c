@@ -1629,7 +1629,7 @@ int main(void) {
                         char flag[16]={0}, fname[ID_MAX]={0}, user[ID_MAX]={0};
                         if (!arg || sscanf(arg, "%15s %63s %63s", flag, fname, user) != 3) { dprintf(cfd, "ERR ADDACCESS bad_args\n"); }
                         else {
-                            char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
+                            char owner[ID_MAX]={0}, access_str[512]={0}, created[64]={0}, lastmod[64]={0};
                             char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
                             load_info_fields(fname,
                                              owner, sizeof(owner),
@@ -1638,13 +1638,67 @@ int main(void) {
                                              lastmod, sizeof(lastmod),
                                              last_access_ts, sizeof(last_access_ts),
                                              last_access_user, sizeof(last_access_user));
-                            if (strstr(access_str, user) == NULL) {
-                                char new_access[512]; if (access_str[0]) snprintf(new_access, sizeof(new_access), "%s, %s (%s)", access_str, user, (strcmp(flag, "-W")==0)?"RW":"R"); else snprintf(new_access, sizeof(new_access), "%s (%s)", user, (strcmp(flag, "-W")==0)?"RW":"R");
-                                strncpy(access_str, new_access, sizeof(access_str)-1); access_str[sizeof(access_str)-1]='\0';
+                            
+                            char new_access[1024]; new_access[0]='\0';
+                            char acc_copy[512]; strncpy(acc_copy, access_str, sizeof(acc_copy)-1); acc_copy[sizeof(acc_copy)-1]='\0';
+                            
+                            bool found = false;
+                            bool first = true;
+                            char *tok = strtok(acc_copy, ",");
+                            while(tok){
+                                while(isspace((unsigned char)*tok)) tok++;
+                                char u[ID_MAX]={0}, p[16]={0};
+                                char *paren = strchr(tok, '(');
+                                if(paren){
+                                    size_t ulen = paren - tok;
+                                    if(ulen >= ID_MAX) ulen = ID_MAX-1;
+                                    strncpy(u, tok, ulen); u[ulen]='\0';
+                                    while(ulen>0 && isspace((unsigned char)u[ulen-1])) u[--ulen]='\0';
+                                    
+                                    char *endp = strchr(paren, ')');
+                                    if(endp){
+                                        size_t plen = endp - (paren+1);
+                                        if(plen >= sizeof(p)) plen = sizeof(p)-1;
+                                        strncpy(p, paren+1, plen); p[plen]='\0';
+                                    }
+                                } else {
+                                    strncpy(u, tok, ID_MAX-1);
+                                }
+
+                                if(strcmp(u, user)==0){
+                                    found = true;
+                                    bool has_r = (strchr(p, 'R') != NULL);
+                                    bool has_w = (strchr(p, 'W') != NULL);
+                                    if(strcmp(flag, "-R")==0) has_r = true;
+                                    if(strcmp(flag, "-W")==0) has_w = true;
+                                    
+                                    if(!first) strcat(new_access, ", ");
+                                    strcat(new_access, user);
+                                    strcat(new_access, " (");
+                                    if(has_r) strcat(new_access, "R");
+                                    if(has_w) strcat(new_access, "W");
+                                    strcat(new_access, ")");
+                                } else {
+                                    if(!first) strcat(new_access, ", ");
+                                    strcat(new_access, tok);
+                                }
+                                first = false;
+                                tok = strtok(NULL, ",");
                             }
+
+                            if(!found){
+                                if(!first) strcat(new_access, ", ");
+                                strcat(new_access, user);
+                                strcat(new_access, " (");
+                                if(strcmp(flag, "-R")==0) strcat(new_access, "R");
+                                else if(strcmp(flag, "-W")==0) strcat(new_access, "RW");
+                                else strcat(new_access, "RW");
+                                strcat(new_access, ")");
+                            }
+                            
                             write_info_txt(fname,
                                            owner[0]?owner:NULL,
-                                           access_str,
+                                           new_access,
                                            created[0]?created:NULL,
                                            lastmod[0]?lastmod:NULL,
                                            last_access_ts[0]?last_access_ts:NULL,

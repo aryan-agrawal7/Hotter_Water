@@ -314,8 +314,8 @@ int main(void) {
             break;
         }
 
-        char verb_token[16]={0};
-        sscanf(cmdline, "%15s", verb_token);
+        char verb_token[32]={0};
+        sscanf(cmdline, "%31s", verb_token);
         if (strcasecmp(verb_token, "READ") == 0) {
             handle_direct_read(client_id, cmdline);
             continue;
@@ -326,6 +326,18 @@ int main(void) {
         }
         if (strcasecmp(verb_token, "STREAM") == 0) {
             handle_direct_stream(client_id, cmdline);
+            continue;
+        }
+        // Checkpoint commands are routed through Name Server
+        if (strcasecmp(verb_token, "CHECKPOINT") == 0 ||
+            strcasecmp(verb_token, "VIEWCHECKPOINT") == 0 ||
+            strcasecmp(verb_token, "REVERT") == 0 ||
+            strcasecmp(verb_token, "LISTCHECKPOINTS") == 0) {
+            int nmfd = connect_addr(NM_IP, NM_PORT);
+            if (nmfd < 0) { continue; }
+            dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
+            read_all_and_print(nmfd);
+            close(nmfd);
             continue;
         }
 

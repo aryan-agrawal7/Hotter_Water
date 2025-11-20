@@ -25,6 +25,7 @@
 #define NM_IP   "127.0.0.1"
 #define NM_PORT 5000
 #define ID_MAX  64
+#define FNAME_MAX 256
 
 static void log_message(const char *level, const char *fmt, ...) {
     time_t now = time(NULL);
@@ -847,6 +848,37 @@ static int swap_path_for(const char *name, char *out, size_t out_sz) {
     return 0;
 }
 
+static int ensure_checkpoints_dir(void) {
+    char ckpt_dir[PATH_MAX];
+    int written = snprintf(ckpt_dir, sizeof(ckpt_dir), "%s/checkpoints", g_storage_dir);
+    if (written < 0 || (size_t)written >= sizeof(ckpt_dir)) return -1;
+    
+    struct stat st;
+    if (stat(ckpt_dir, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) {
+            log_message("ERROR", "checkpoints path exists but is not a directory");
+            return -1;
+        }
+        return 0;
+    }
+    if (errno != ENOENT) return -1;
+    if (mkdir(ckpt_dir, 0777) < 0) {
+        log_message("ERROR", "failed to create checkpoints directory: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static int checkpoint_path_for(const char *filename, const char *tag, char *out, size_t out_sz) {
+    if (ensure_checkpoints_dir() < 0) return -1;
+    int written = snprintf(out, out_sz, "%s/checkpoints/%s_%s", g_storage_dir, filename, tag);
+    if (written < 0 || (size_t)written >= out_sz) {
+        log_message("ERROR", "checkpoint path truncation");
+        return -1;
+    }
+    return 0;
+}
+
 static int copy_file_to_path(const char *src_path, const char *dst_path) {
     int src = open(src_path, O_RDONLY);
     if (src < 0) {
@@ -1366,6 +1398,201 @@ static void handle_undo(int cfd, const char *ss_id, const char *client_id, const
 #define MAX_DOCS 64
 static Document *g_docs[MAX_DOCS];
 
+static void handle_checkpoint(int cfd, const char *ss_id, const char *client_id, const char *filename, const char *tag) {
+    if (!filename || !tag || !is_valid_name_component(filename)) {
+        dprintf(cfd, "ERR CHECKPOINT invalid_args\n");
+        return;
+    }
+    
+    char src_path[PATH_MAX], ckpt_path[PATH_MAX];
+    if (storage_path_for(filename, src_path, sizeof(src_path)) < 0) {
+        dprintf(cfd, "ERR CHECKPOINT path_error\n");
+        return;
+    }
+    if (checkpoint_path_for(filename, tag, ckpt_path, sizeof(ckpt_path)) < 0) {
+        dprintf(cfd, "ERR CHECKPOINT checkpoint_path_error\n");
+        return;
+    }
+    
+    if (copy_file_to_path(src_path, ckpt_path) < 0) {
+        dprintf(cfd, "ERR CHECKPOINT copy_failed %s\n", strerror(errno));
+        log_message("ERROR", "[SS %s] Failed to create checkpoint %s for %s by %s: %s", 
+                    ss_id, tag, filename, client_id, strerror(errno));
+        return;
+    }
+    
+    log_message("INFO", "[SS %s] Created checkpoint %s for %s by %s", ss_id, tag, filename, client_id);
+    dprintf(cfd, "ACK %s CHECKPOINT %s %s\n", ss_id, filename, tag);
+}
+
+static void handle_viewcheckpoint(int cfd, const char *ss_id, const char *client_id, const char *filename, const char *tag) {
+    if (!filename || !tag || !is_valid_name_component(filename)) {
+        dprintf(cfd, "ERR VIEWCHECKPOINT invalid_args\n");
+        return;
+    }
+    
+    char ckpt_path[PATH_MAX];
+    if (checkpoint_path_for(filename, tag, ckpt_path, sizeof(ckpt_path)) < 0) {
+        dprintf(cfd, "ERR VIEWCHECKPOINT path_error\n");
+        return;
+    }
+    
+    int fd = open(ckpt_path, O_RDONLY);
+    if (fd < 0) {
+        dprintf(cfd, "ERR VIEWCHECKPOINT notfound %s\n", strerror(errno));
+        log_message("ERROR", "[SS %s] Checkpoint %s for %s not found by %s", ss_id, tag, filename, client_id);
+        return;
+    }
+    
+    struct stat st;
+    long long size = -1;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) size = st.st_size;
+    
+    dprintf(cfd, "DATA %s VIEWCHECKPOINT %s %s %lld\n", ss_id, filename, tag, size);
+    
+    char buffer[4096];
+    ssize_t rbytes;
+    int send_failed = 0;
+    while ((rbytes = read(fd, buffer, sizeof(buffer))) > 0) {
+        if (send_all(cfd, buffer, (size_t)rbytes) < 0) {
+            send_failed = 1;
+            log_message("ERROR", "[SS %s] send failure for checkpoint %s: %s", ss_id, tag, strerror(errno));
+            break;
+        }
+    }
+    
+    if (rbytes < 0 && !send_failed) {
+        dprintf(cfd, "\nERR VIEWCHECKPOINT read_error\n");
+    } else if (!send_failed) {
+        dprintf(cfd, "\nENDDATA %s VIEWCHECKPOINT %s %s\n", ss_id, filename, tag);
+        log_message("INFO", "[SS %s] Sent checkpoint %s for %s to %s", ss_id, tag, filename, client_id);
+    }
+    
+    close(fd);
+}
+
+static void handle_revert(int cfd, const char *ss_id, const char *client_id, const char *filename, const char *tag) {
+    if (!filename || !tag || !is_valid_name_component(filename)) {
+        dprintf(cfd, "ERR REVERT invalid_args\n");
+        return;
+    }
+    
+    char ckpt_path[PATH_MAX], dest_path[PATH_MAX], undo_path[PATH_MAX];
+    if (checkpoint_path_for(filename, tag, ckpt_path, sizeof(ckpt_path)) < 0) {
+        dprintf(cfd, "ERR REVERT checkpoint_path_error\n");
+        return;
+    }
+    if (storage_path_for(filename, dest_path, sizeof(dest_path)) < 0) {
+        dprintf(cfd, "ERR REVERT storage_path_error\n");
+        return;
+    }
+    
+    // Check if checkpoint exists
+    struct stat st;
+    if (stat(ckpt_path, &st) != 0) {
+        dprintf(cfd, "ERR REVERT checkpoint_notfound %s\n", strerror(errno));
+        log_message("ERROR", "[SS %s] Checkpoint %s for %s not found by %s", ss_id, tag, filename, client_id);
+        return;
+    }
+    
+    // CRITICAL: Create undo backup BEFORE reverting (so UNDO can revert the REVERT)
+    if (undo_path_for(filename, undo_path, sizeof(undo_path)) == 0) {
+        // Check if current file exists
+        if (stat(dest_path, &st) == 0) {
+            // Backup current state to undo file before reverting
+            if (copy_file_to_path(dest_path, undo_path) < 0) {
+                log_message("WARN", "[SS %s] Failed to create undo backup for %s before REVERT by %s",
+                           ss_id, filename, client_id);
+                // Continue with revert even if undo backup fails
+            } else {
+                log_message("INFO", "[SS %s] Created undo backup for %s before REVERT to %s by %s",
+                           ss_id, filename, tag, client_id);
+            }
+        }
+    }
+    
+    // Now perform the revert: copy checkpoint to actual file
+    if (copy_file_to_path(ckpt_path, dest_path) < 0) {
+        dprintf(cfd, "ERR REVERT copy_failed %s\n", strerror(errno));
+        log_message("ERROR", "[SS %s] Failed to revert %s to checkpoint %s by %s: %s",
+                    ss_id, filename, tag, client_id, strerror(errno));
+        return;
+    }
+    
+    // Update metadata with new timestamp
+    char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
+    char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
+    load_info_fields(filename,
+                     owner, sizeof(owner),
+                     access_str, sizeof(access_str),
+                     created, sizeof(created),
+                     lastmod, sizeof(lastmod),
+                     last_access_ts, sizeof(last_access_ts),
+                     last_access_user, sizeof(last_access_user));
+    char now[64];
+    format_time_now(now, sizeof(now));
+    write_info_txt(filename,
+                   owner[0]?owner:NULL,
+                   access_str,
+                   created[0]?created:NULL,
+                   now,  // Update last modified time
+                   now,  // Update last access time
+                   client_id);
+    
+    // Invalidate in-memory document cache
+    invalidate_document(filename);
+    
+    log_message("INFO", "[SS %s] Reverted %s to checkpoint %s by %s", ss_id, filename, tag, client_id);
+    dprintf(cfd, "ACK %s REVERT %s %s\n", ss_id, filename, tag);
+}
+
+static void handle_listcheckpoints(int cfd, const char *ss_id, const char *client_id, const char *filename) {
+    if (!filename || !is_valid_name_component(filename)) {
+        dprintf(cfd, "ERR LISTCHECKPOINTS invalid_filename\n");
+        return;
+    }
+    
+    if (ensure_checkpoints_dir() < 0) {
+        dprintf(cfd, "ERR LISTCHECKPOINTS no_checkpoint_dir\n");
+        return;
+    }
+    
+    char ckpt_dir[PATH_MAX];
+    snprintf(ckpt_dir, sizeof(ckpt_dir), "%s/checkpoints", g_storage_dir);
+    
+    DIR *d = opendir(ckpt_dir);
+    if (!d) {
+        dprintf(cfd, "ERR LISTCHECKPOINTS cannot_open_dir %s\n", strerror(errno));
+        return;
+    }
+    
+    char prefix[FNAME_MAX + 2];
+    snprintf(prefix, sizeof(prefix), "%s_", filename);
+    size_t prefix_len = strlen(prefix);
+    
+    dprintf(cfd, "CHECKPOINTS %s\n", filename);
+    
+    struct dirent *entry;
+    int count = 0;
+    while ((entry = readdir(d)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        if (strncmp(entry->d_name, prefix, prefix_len) == 0) {
+            const char *tag = entry->d_name + prefix_len;
+            dprintf(cfd, "  %s\n", tag);
+            count++;
+        }
+    }
+    
+    closedir(d);
+    
+    if (count == 0) {
+        dprintf(cfd, "  (no checkpoints)\n");
+    }
+    
+    dprintf(cfd, "END_CHECKPOINTS %s\n", filename);
+    log_message("INFO", "[SS %s] Listed %d checkpoints for %s to %s", ss_id, count, filename, client_id);
+}
+
 static Document *get_document(const char *filename) {
     for (int i = 0; i < MAX_DOCS; ++i) {
         if (g_docs[i] && strcmp(g_docs[i]->filename, filename) == 0) {
@@ -1840,6 +2067,33 @@ int main(void) {
                         handle_write_commit(cfd, ss_id, client_id);
                     } else if (strcmp(verb_upper, "UNDO") == 0) {
                         handle_undo(cfd, ss_id, client_id, arg);
+                    } else if (strcmp(verb_upper, "CHECKPOINT") == 0) {
+                        char fname[FNAME_MAX]={0}, tag[ID_MAX]={0};
+                        if (arg && sscanf(arg, "%255s %63s", fname, tag) == 2) {
+                            handle_checkpoint(cfd, ss_id, client_id, fname, tag);
+                        } else {
+                            dprintf(cfd, "ERR CHECKPOINT missing_args\n");
+                        }
+                    } else if (strcmp(verb_upper, "VIEWCHECKPOINT") == 0) {
+                        char fname[FNAME_MAX]={0}, tag[ID_MAX]={0};
+                        if (arg && sscanf(arg, "%255s %63s", fname, tag) == 2) {
+                            handle_viewcheckpoint(cfd, ss_id, client_id, fname, tag);
+                        } else {
+                            dprintf(cfd, "ERR VIEWCHECKPOINT missing_args\n");
+                        }
+                    } else if (strcmp(verb_upper, "REVERT") == 0) {
+                        char fname[FNAME_MAX]={0}, tag[ID_MAX]={0};
+                        if (arg && sscanf(arg, "%255s %63s", fname, tag) == 2) {
+                            handle_revert(cfd, ss_id, client_id, fname, tag);
+                        } else {
+                            dprintf(cfd, "ERR REVERT missing_args\n");
+                        }
+                    } else if (strcmp(verb_upper, "LISTCHECKPOINTS") == 0) {
+                        if (arg && arg[0]) {
+                            handle_listcheckpoints(cfd, ss_id, client_id, arg);
+                        } else {
+                            dprintf(cfd, "ERR LISTCHECKPOINTS missing_filename\n");
+                        }
                     } else if (is_number_string(verb)) {
                         handle_write_update(cfd, ss_id, client_id, verb, arg);
                     } else {

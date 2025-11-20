@@ -1086,6 +1086,74 @@ static void handle_undo(int cfd, const char *client, const char *fname){
     send_one_line_to_ss(ss_ref.id, client, payload, cfd);
 }
 
+static void handle_checkpoint(int cfd, const char *client, const char *fname, const char *tag){
+    log_message("INFO", "Client %s requested CHECKPOINT %s %s", client, fname, tag);
+    pthread_mutex_lock(&g_mtx);
+    int i=fv_find(&ALL_FILES, fname);
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
+    FILE_META_DATA *m=&ALL_FILES.v[i];
+    bool ok = has_read(m, client);
+    SSInfo ss_ref; int sidx = ss_find_index(m->ss_id);
+    if(!ok){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR PERMISSION_DENIED"); return; }
+    if(sidx<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR STORAGE_SERVER_NOT_FOUND %s", m->ss_id); return; }
+    ss_ref = g_ss[sidx];
+    pthread_mutex_unlock(&g_mtx);
+
+    char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "CHECKPOINT %s %s", fname, tag);
+    send_one_line_to_ss(ss_ref.id, client, payload, cfd);
+}
+
+static void handle_viewcheckpoint(int cfd, const char *client, const char *fname, const char *tag){
+    log_message("INFO", "Client %s requested VIEWCHECKPOINT %s %s", client, fname, tag);
+    pthread_mutex_lock(&g_mtx);
+    int i=fv_find(&ALL_FILES, fname);
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
+    FILE_META_DATA *m=&ALL_FILES.v[i];
+    bool ok = has_read(m, client);
+    SSInfo ss_ref; int sidx = ss_find_index(m->ss_id);
+    if(!ok){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR PERMISSION_DENIED"); return; }
+    if(sidx<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR STORAGE_SERVER_NOT_FOUND %s", m->ss_id); return; }
+    ss_ref = g_ss[sidx];
+    pthread_mutex_unlock(&g_mtx);
+
+    char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "VIEWCHECKPOINT %s %s", fname, tag);
+    send_one_line_to_ss(ss_ref.id, client, payload, cfd);
+}
+
+static void handle_revert(int cfd, const char *client, const char *fname, const char *tag){
+    log_message("INFO", "Client %s requested REVERT %s %s", client, fname, tag);
+    pthread_mutex_lock(&g_mtx);
+    int i=fv_find(&ALL_FILES, fname);
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
+    FILE_META_DATA *m=&ALL_FILES.v[i];
+    bool ok = has_write(m, client);
+    SSInfo ss_ref; int sidx = ss_find_index(m->ss_id);
+    if(!ok){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR PERMISSION_DENIED"); return; }
+    if(sidx<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR STORAGE_SERVER_NOT_FOUND %s", m->ss_id); return; }
+    ss_ref = g_ss[sidx];
+    pthread_mutex_unlock(&g_mtx);
+
+    char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "REVERT %s %s", fname, tag);
+    send_one_line_to_ss(ss_ref.id, client, payload, cfd);
+}
+
+static void handle_listcheckpoints(int cfd, const char *client, const char *fname){
+    log_message("INFO", "Client %s requested LISTCHECKPOINTS %s", client, fname);
+    pthread_mutex_lock(&g_mtx);
+    int i=fv_find(&ALL_FILES, fname);
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
+    FILE_META_DATA *m=&ALL_FILES.v[i];
+    bool ok = has_read(m, client);
+    SSInfo ss_ref; int sidx = ss_find_index(m->ss_id);
+    if(!ok){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR PERMISSION_DENIED"); return; }
+    if(sidx<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR STORAGE_SERVER_NOT_FOUND %s", m->ss_id); return; }
+    ss_ref = g_ss[sidx];
+    pthread_mutex_unlock(&g_mtx);
+
+    char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "LISTCHECKPOINTS %s", fname);
+    send_one_line_to_ss(ss_ref.id, client, payload, cfd);
+}
+
 static void handle_write(int cfd, const char *client, const char *fname, const char *sent_str, int client_fd){
     log_message("INFO", "Client %s requested WRITE %s (sent=%s)", client, fname, sent_str);
     (void)client_fd;
@@ -1259,6 +1327,38 @@ static void *worker(void *arg_) {
                 if (sscanf(payload, "DENYACCESS %255s %63s", fname, user)==2)
                     handle_denyaccess(fd, client_id, fname, user);
                 else send_line(fd,"ERROR BAD_DENYACCESS");
+                close(fd); return NULL;
+            }
+
+            if (strcasecmp(verb,"CHECKPOINT")==0) {
+                char fname[FNAME_MAX]={0}, tag[ID_MAX]={0};
+                if (sscanf(payload, "CHECKPOINT %255s %63s", fname, tag)==2)
+                    handle_checkpoint(fd, client_id, fname, tag);
+                else send_line(fd,"ERROR BAD_CHECKPOINT");
+                close(fd); return NULL;
+            }
+
+            if (strcasecmp(verb,"VIEWCHECKPOINT")==0) {
+                char fname[FNAME_MAX]={0}, tag[ID_MAX]={0};
+                if (sscanf(payload, "VIEWCHECKPOINT %255s %63s", fname, tag)==2)
+                    handle_viewcheckpoint(fd, client_id, fname, tag);
+                else send_line(fd,"ERROR BAD_VIEWCHECKPOINT");
+                close(fd); return NULL;
+            }
+
+            if (strcasecmp(verb,"REVERT")==0) {
+                char fname[FNAME_MAX]={0}, tag[ID_MAX]={0};
+                if (sscanf(payload, "REVERT %255s %63s", fname, tag)==2)
+                    handle_revert(fd, client_id, fname, tag);
+                else send_line(fd,"ERROR BAD_REVERT");
+                close(fd); return NULL;
+            }
+
+            if (strcasecmp(verb,"LISTCHECKPOINTS")==0) {
+                char fname[FNAME_MAX]={0};
+                if (sscanf(payload, "LISTCHECKPOINTS %255s", fname)==1)
+                    handle_listcheckpoints(fd, client_id, fname);
+                else send_line(fd,"ERROR BAD_LISTCHECKPOINTS");
                 close(fd); return NULL;
             }
 

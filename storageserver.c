@@ -1762,7 +1762,10 @@ int main(void) {
                                     bool has_r = (strchr(p, 'R') != NULL);
                                     bool has_w = (strchr(p, 'W') != NULL);
                                     if(strcmp(flag, "-R")==0) has_r = true;
-                                    if(strcmp(flag, "-W")==0) has_w = true;
+                                    if(strcmp(flag, "-W")==0) {
+                                        has_w = true;
+                                        has_r = true;  // Write access implies read access
+                                    }
                                     
                                     if(!first) strcat(new_access, ", ");
                                     strcat(new_access, user);
@@ -1783,7 +1786,7 @@ int main(void) {
                                 strcat(new_access, user);
                                 strcat(new_access, " (");
                                 if(strcmp(flag, "-R")==0) strcat(new_access, "R");
-                                else if(strcmp(flag, "-W")==0) strcat(new_access, "W");
+                                else if(strcmp(flag, "-W")==0) strcat(new_access, "RW");  // Write implies read
                                 else strcat(new_access, "RW");
                                 strcat(new_access, ")");
                             }

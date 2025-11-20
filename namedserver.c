@@ -19,6 +19,10 @@
 //     ADDACCESS -R <filename> <username>
 //     ADDACCESS -W <filename> <username>
 //     REMACCESS  <filename> <username>
+//     REQUESTACCESS -R/-W <filename>
+//     VIEWREQUESTS
+//     APPROVEACCESS <filename> <username>
+//     DENYACCESS <filename> <username>
 //
 // StorageServer contract (unchanged from Step-1):
 //   Accepts ONE line then replies with "ACK <ss_id>\n" and closes.
@@ -30,6 +34,7 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <limits.h>
@@ -421,6 +426,51 @@ static int heap_top(){
     return g_heap[0];
 }
 
+// ----------------------- access request management -----------------------
+typedef struct {
+    char requester[ID_MAX];
+    char filename[FNAME_MAX];
+    char access_type[4];  // "-R" or "-W"
+    time_t timestamp;
+} AccessRequest;
+
+typedef struct {
+    AccessRequest *v;
+    int n, cap;
+} AccessRequestVec;
+
+static AccessRequestVec PENDING_REQUESTS;
+
+static void arv_init(AccessRequestVec *arv){ arv->v=NULL; arv->n=0; arv->cap=0; }
+static void arv_free(AccessRequestVec *arv){ free(arv->v); arv->v=NULL; arv->n=arv->cap=0; }
+static void arv_reserve(AccessRequestVec *arv, int need){
+    if(need<=arv->cap) return;
+    int nc = arv->cap ? arv->cap*2 : 16;
+    if(nc<need) nc=need;
+    arv->v=realloc(arv->v, nc*sizeof(AccessRequest));
+    arv->cap=nc;
+}
+static int arv_find(AccessRequestVec *arv, const char *requester, const char *filename){
+    for(int i=0; i<arv->n; i++){
+        if(strcmp(arv->v[i].requester, requester)==0 && strcmp(arv->v[i].filename, filename)==0)
+            return i;
+    }
+    return -1;
+}
+static void arv_add(AccessRequestVec *arv, const char *requester, const char *filename, const char *access_type){
+    arv_reserve(arv, arv->n+1);
+    AccessRequest *r = &arv->v[arv->n++];
+    strncpy(r->requester, requester, ID_MAX-1); r->requester[ID_MAX-1]='\0';
+    strncpy(r->filename, filename, FNAME_MAX-1); r->filename[FNAME_MAX-1]='\0';
+    strncpy(r->access_type, access_type, 3); r->access_type[3]='\0';
+    r->timestamp = time(NULL);
+}
+static void arv_remove_at(AccessRequestVec *arv, int idx){
+    if(idx<0 || idx>=arv->n) return;
+    for(int j=idx+1; j<arv->n; j++) arv->v[j-1] = arv->v[j];
+    arv->n--;
+}
+
 // ----------------------- global metadata -----------------------
 static FileVec ALL_FILES;
 static StrList USER_LIST;
@@ -733,6 +783,8 @@ static void handle_addaccess(int cfd, const char *client, const char *flag, cons
             return;
         }
         sl_add_unique(&m->wr, user);
+        // Write access implies read access
+        sl_add_unique(&m->rd, user);
     }
 
     // notify SS to persist access change
@@ -764,6 +816,180 @@ static void handle_remaccess(int cfd, const char *client, const char *fname, con
     pthread_mutex_unlock(&g_mtx);
     send_line(cfd, "OK REMACCESS %s %s", fname, user);
     send_one_line_to_ss(ss_id, client, payload, cfd);
+}
+
+static void handle_requestaccess(int cfd, const char *client, const char *flag, const char *fname){
+    log_message("INFO", "Client %s requested REQUESTACCESS %s %s", client, flag, fname);
+    if(!flag || !*flag || !fname || !*fname){
+        send_line(cfd, "ERROR BAD_REQUESTACCESS");
+        return;
+    }
+    if(strcmp(flag, "-R")!=0 && strcmp(flag, "-W")!=0){
+        send_line(cfd, "ERROR incorrect Flags (use -R or -W)");
+        return;
+    }
+    
+    pthread_mutex_lock(&g_mtx);
+    int i = fv_find(&ALL_FILES, fname);
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR File Doesnt Exist"); return; }
+    FILE_META_DATA *m=&ALL_FILES.v[i];
+    
+    if(strcmp(m->owner, client)==0){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd, "ERROR You are the owner, no need to request access");
+        return;
+    }
+    
+    // Check if user already has the requested access
+    if(strcmp(flag, "-R")==0 && sl_contains(&m->rd, client)){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd, "ERROR You already have Read access");
+        return;
+    }
+    if(strcmp(flag, "-W")==0 && sl_contains(&m->wr, client)){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd, "ERROR You already have Write access");
+        return;
+    }
+    
+    // Check if request already exists
+    int req_idx = arv_find(&PENDING_REQUESTS, client, fname);
+    if(req_idx >= 0){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd, "ERROR Request already pending for this file");
+        return;
+    }
+    
+    // Add request
+    arv_add(&PENDING_REQUESTS, client, fname, flag);
+    pthread_mutex_unlock(&g_mtx);
+    
+    send_line(cfd, "OK Access request submitted for %s %s (Owner: %s will review)", flag, fname, m->owner);
+    log_message("INFO", "Access request added: %s requests %s access to %s (owner: %s)", client, flag, fname, m->owner);
+}
+
+static void handle_viewrequests(int cfd, const char *client){
+    log_message("INFO", "Client %s requested VIEWREQUESTS", client);
+    
+    pthread_mutex_lock(&g_mtx);
+    
+    // Count requests for files owned by this client
+    int count = 0;
+    for(int i=0; i<PENDING_REQUESTS.n; i++){
+        AccessRequest *req = &PENDING_REQUESTS.v[i];
+        int fidx = fv_find(&ALL_FILES, req->filename);
+        if(fidx >= 0 && strcmp(ALL_FILES.v[fidx].owner, client)==0){
+            count++;
+        }
+    }
+    
+    if(count == 0){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd, "No pending access requests for your files");
+        return;
+    }
+    
+    send_line(cfd, "Pending Access Requests (%d):", count);
+    send_line(cfd, "================================");
+    
+    for(int i=0; i<PENDING_REQUESTS.n; i++){
+        AccessRequest *req = &PENDING_REQUESTS.v[i];
+        int fidx = fv_find(&ALL_FILES, req->filename);
+        if(fidx >= 0 && strcmp(ALL_FILES.v[fidx].owner, client)==0){
+            char time_str[64];
+            struct tm *tm = localtime(&req->timestamp);
+            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm);
+            send_line(cfd, "User: %s | File: %s | Access: %s | Time: %s",
+                     req->requester, req->filename, req->access_type, time_str);
+        }
+    }
+    
+    pthread_mutex_unlock(&g_mtx);
+    log_message("INFO", "Displayed %d pending requests to %s", count, client);
+}
+
+static void handle_approveaccess(int cfd, const char *client, const char *fname, const char *user){
+    log_message("INFO", "Client %s requested APPROVEACCESS %s %s", client, fname, user);
+    if(!fname || !*fname || !user || !*user){
+        send_line(cfd, "ERROR BAD_APPROVEACCESS");
+        return;
+    }
+    
+    pthread_mutex_lock(&g_mtx);
+    
+    // Check if file exists and client is owner
+    int i = fv_find(&ALL_FILES, fname);
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR File Doesnt Exist"); return; }
+    FILE_META_DATA *m=&ALL_FILES.v[i];
+    if(strcmp(m->owner, client)!=0){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd,"ERROR Not the Owner");
+        return;
+    }
+    
+    // Find the request
+    int req_idx = arv_find(&PENDING_REQUESTS, user, fname);
+    if(req_idx < 0){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd, "ERROR No pending request from this user for this file");
+        return;
+    }
+    
+    // Get the requested access type from the stored request
+    AccessRequest *req = &PENDING_REQUESTS.v[req_idx];
+    char flag[4];
+    strncpy(flag, req->access_type, 3);
+    flag[3] = '\0';
+    
+    // Remove request from pending list before granting access
+    arv_remove_at(&PENDING_REQUESTS, req_idx);
+    pthread_mutex_unlock(&g_mtx);
+    
+    // Now reuse handle_addaccess to grant the access
+    log_message("INFO", "Owner %s approving %s access to %s for %s (delegating to ADDACCESS)", client, flag, fname, user);
+    handle_addaccess(cfd, client, flag, fname, user);
+}
+
+static void handle_denyaccess(int cfd, const char *client, const char *fname, const char *user){
+    log_message("INFO", "Client %s requested DENYACCESS %s %s", client, fname, user);
+    if(!fname || !*fname || !user || !*user){
+        send_line(cfd, "ERROR BAD_DENYACCESS");
+        return;
+    }
+    
+    pthread_mutex_lock(&g_mtx);
+    
+    // Check if user exists
+    if(!sl_contains(&USER_LIST, user)){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd,"ERROR User Doesnt Exist");
+        return;
+    }
+    
+    // Check if file exists and client is owner
+    int i = fv_find(&ALL_FILES, fname);
+    if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR File Doesnt Exist"); return; }
+    FILE_META_DATA *m=&ALL_FILES.v[i];
+    if(strcmp(m->owner, client)!=0){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd,"ERROR Not the Owner");
+        return;
+    }
+    
+    // Find and remove the request
+    int req_idx = arv_find(&PENDING_REQUESTS, user, fname);
+    if(req_idx < 0){
+        pthread_mutex_unlock(&g_mtx);
+        send_line(cfd, "ERROR No pending request from this user for this file");
+        return;
+    }
+    
+    // Remove request from pending list
+    arv_remove_at(&PENDING_REQUESTS, req_idx);
+    pthread_mutex_unlock(&g_mtx);
+    
+    send_line(cfd, "OK Access request denied and removed: %s from %s", fname, user);
+    log_message("INFO", "Owner %s denied access request to %s from %s", client, fname, user);
 }
 
 static void handle_delete(int cfd, const char *client, const char *fname){
@@ -1002,6 +1228,40 @@ static void *worker(void *arg_) {
                 close(fd); return NULL;
             }
 
+            if (strcasecmp(verb,"REQUESTACCESS")==0) {
+                char *args = payload + strlen(verb);
+                while(*args && isspace(*args)) args++;
+                char *save = NULL;
+                char *tok = strtok_r(args, " \t\r\n", &save);
+                char *flag_tok = tok;  // -R or -W
+                char *fname_tok = strtok_r(NULL, " \t\r\n", &save);
+                if(flag_tok && fname_tok)
+                    handle_requestaccess(fd, client_id, flag_tok, fname_tok);
+                else send_line(fd,"ERROR BAD_REQUESTACCESS");
+                close(fd); return NULL;
+            }
+
+            if (strcasecmp(verb,"VIEWREQUESTS")==0) {
+                handle_viewrequests(fd, client_id);
+                close(fd); return NULL;
+            }
+
+            if (strcasecmp(verb,"APPROVEACCESS")==0) {
+                char fname[FNAME_MAX]={0}, user[ID_MAX]={0};
+                if (sscanf(payload, "APPROVEACCESS %255s %63s", fname, user)==2)
+                    handle_approveaccess(fd, client_id, fname, user);
+                else send_line(fd,"ERROR BAD_APPROVEACCESS");
+                close(fd); return NULL;
+            }
+
+            if (strcasecmp(verb,"DENYACCESS")==0) {
+                char fname[FNAME_MAX]={0}, user[ID_MAX]={0};
+                if (sscanf(payload, "DENYACCESS %255s %63s", fname, user)==2)
+                    handle_denyaccess(fd, client_id, fname, user);
+                else send_line(fd,"ERROR BAD_DENYACCESS");
+                close(fd); return NULL;
+            }
+
             if (strcasecmp(verb,"DELETE")==0) {
                 char fname[FNAME_MAX]={0};
                 if (sscanf(payload, "DELETE %255s", fname)==1)
@@ -1219,6 +1479,7 @@ static void *worker(void *arg_) {
 int main(void) {
     fv_init(&ALL_FILES);
     sl_init(&USER_LIST);
+    arv_init(&PENDING_REQUESTS);
     file_map_init(&FILE_MAP);
     file_cache_init(&FILE_CACHE);
 

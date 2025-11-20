@@ -698,8 +698,22 @@ static void handle_addaccess(int cfd, const char *client, const char *flag, cons
     FILE_META_DATA *m=&ALL_FILES.v[i];
     if(strcmp(m->owner, client)!=0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR Not the Owner"); return; }
 
-    if(strcmp(flag,"-R")==0)      sl_add_unique(&m->rd, user);
-    else                           sl_add_unique(&m->wr, user);
+    if(strcmp(flag,"-R")==0){
+        if(sl_contains(&m->rd, user)){
+            pthread_mutex_unlock(&g_mtx);
+            send_line(cfd, "ERROR User already has Read access");
+            return;
+        }
+        sl_add_unique(&m->rd, user);
+    }
+    else {
+        if(sl_contains(&m->wr, user)){
+            pthread_mutex_unlock(&g_mtx);
+            send_line(cfd, "ERROR User already has Write access");
+            return;
+        }
+        sl_add_unique(&m->wr, user);
+    }
 
     // notify SS to persist access change
     char payload[LINE_MAX]; snprintf(payload,sizeof(payload), "ADDACCESS %s %s %s", flag, fname, user);

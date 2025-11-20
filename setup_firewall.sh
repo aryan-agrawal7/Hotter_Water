@@ -1,3 +1,4 @@
+############## LLM Generated Code Begins ##############
 #!/bin/bash
 # Script to add NamedServer and StorageServer to macOS firewall exceptions
 # Run this after recompiling: sudo ./setup_firewall.sh
@@ -16,3 +17,4 @@ sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$SCRIPT_DIR/Client"
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$SCRIPT_DIR/Client"
 
 echo "✅ Firewall exceptions added successfully!"
+############## LLM Generated Code Ends ################

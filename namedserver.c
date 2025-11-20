@@ -1,3 +1,4 @@
+// ############## LLM Generated Code Begins ##############
 // NamedServer.c (Step-2)
 //
 // Protocol supported now:
@@ -1736,3 +1737,4 @@ int main(void) {
     file_map_free(&FILE_MAP);
     return 0;
 }
+// ############## LLM Generated Code Ends ################

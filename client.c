@@ -1,3 +1,4 @@
+// ############## LLM Generated Code Begins ##############
 // Client.c (Step-2)
 // - Prompts for client unique id (username).
 // - Registers with Name Server.
@@ -358,3 +359,4 @@ int main(int argc, char *argv[]) {
     }
     return 0;
 }
+// ############## LLM Generated Code Ends ################

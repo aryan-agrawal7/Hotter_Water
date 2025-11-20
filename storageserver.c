@@ -1,3 +1,4 @@
+// ############## LLM Generated Code Begins ##############
 // StorageServer.c
 // Registers with Name Server, then listens for client connections.
 // On each client connect, reads one HELLO line and logs the required debug message.
@@ -2116,3 +2117,4 @@ int main(int argc, char *argv[]) {
     }
     return 0;
 }
+// ############## LLM Generated Code Ends ################

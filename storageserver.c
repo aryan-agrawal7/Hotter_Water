@@ -22,10 +22,11 @@
 #include <dirent.h>
 #include <stdarg.h>
 
-#define NM_IP   "127.0.0.1"
-#define NM_PORT 5000
 #define ID_MAX  64
 #define FNAME_MAX 256
+
+static char g_nm_ip[64] = "127.0.0.1";
+static int g_nm_port = 5000;
 
 static void log_message(const char *level, const char *fmt, ...) {
     time_t now = time(NULL);
@@ -78,7 +79,7 @@ static void send_existing_files_to_nm(const char *ss_id) {
     closedir(d);
 
     if (count > 0) {
-        int nmfd = connect_to_nm(NM_IP, NM_PORT);
+        int nmfd = connect_to_nm(g_nm_ip, g_nm_port);
         if (nmfd >= 0) {
             dprintf(nmfd, "SS_LOG_FILES %s %s\n", ss_id, file_list);
             char resp[LINE_MAX];
@@ -1622,8 +1623,17 @@ static void invalidate_document(const char *filename) {
     }
 }
 
-int main(void) {
+int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
+
+    if (argc == 3) {
+        strncpy(g_nm_ip, argv[1], sizeof(g_nm_ip) - 1);
+        g_nm_port = atoi(argv[2]);
+    } else if (argc != 1) {
+        fprintf(stderr, "Usage: %s [nm_ip nm_port]\n", argv[0]);
+        return 1;
+    }
+
     char ss_id[ID_MAX];
     int client_port;
 
@@ -1648,7 +1658,7 @@ int main(void) {
     log_message("INFO", "[Storage Server %s] is now listening for clients on port %d", ss_id, client_port);
 
     // Register with Name Server
-    int nmfd = connect_to_nm(NM_IP, NM_PORT);
+    int nmfd = connect_to_nm(g_nm_ip, g_nm_port);
     dprintf(nmfd, "REGISTER %s %d\n", ss_id, client_port);
     char resp[LINE_MAX]; read_line(nmfd, resp, sizeof(resp));
     log_message("INFO", "[SS %s] Named Server response: %s", ss_id, resp);

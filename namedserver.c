@@ -49,6 +49,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -73,6 +75,36 @@ static void log_message(const char *level, const char *fmt, ...) {
     vfprintf(stderr, fmt, args);
     va_end(args);
     fprintf(stderr, "\n");
+}
+
+static void print_ip_addresses() {
+    struct ifaddrs *ifaddr, *ifa;
+    int family, s;
+    char host[NI_MAXHOST];
+
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        return;
+    }
+
+    printf("Named Server IP Addresses:\n");
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL)
+            continue;
+
+        family = ifa->ifa_addr->sa_family;
+
+        if (family == AF_INET) {
+            s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                            host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0) {
+                printf("getnameinfo() failed: %s\n", gai_strerror(s));
+                continue;
+            }
+            printf("  %s: %s\n", ifa->ifa_name, host);
+        }
+    }
+    freeifaddrs(ifaddr);
 }
 
 #define FILE_INITIAL_CAPACITY 256
@@ -1544,6 +1576,7 @@ static void *worker(void *arg_) {
             }
 
             // Unknown verb
+           
             log_message("WARN", "Unknown command from client %s: %s", client_id, verb);
             send_line(fd,"ERROR unknown command");
             close(fd); return NULL;
@@ -1585,6 +1618,7 @@ int main(void) {
 
     int listen_fd = create_listen_socket(NM_PORT);
     log_message("INFO", "Named server has started on port %d", NM_PORT);
+    print_ip_addresses();
 
     while (1) {
         struct sockaddr_in cli; socklen_t clilen = sizeof(cli);

@@ -32,12 +32,13 @@
 #include <time.h>
 #include <stdarg.h>
 
-#define NM_IP    "127.0.0.1"
-#define NM_PORT  5000
 #define ID_MAX   64
 #define LINE_MAX 4096
 #define FNAME_MAX 256
 #define IP_MAX    64
+
+static char g_nm_ip[64] = "127.0.0.1";
+static int g_nm_port = 5000;
 
 // --- helpers ---
 static void log_message(const char *level, const char *fmt, ...) {
@@ -121,7 +122,7 @@ typedef struct {
 
 static bool request_direct_endpoint(const char *client_id, const char *cmdline, DirectEndpoint *out) {
     log_message("INFO", "Client %s requesting direct endpoint for command: %s", client_id, cmdline);
-    int nmfd = connect_addr(NM_IP, NM_PORT);
+    int nmfd = connect_addr(g_nm_ip, g_nm_port);
     if (nmfd < 0) return false;
     dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
     char first_line[LINE_MAX];
@@ -263,7 +264,15 @@ static void handle_direct_write(const char *client_id, const char *cmdline) {
 }
 
 // --- main ---
-int main(void) {
+int main(int argc, char *argv[]) {
+    if (argc == 3) {
+        strncpy(g_nm_ip, argv[1], sizeof(g_nm_ip) - 1);
+        g_nm_port = atoi(argv[2]);
+    } else if (argc != 1) {
+        fprintf(stderr, "Usage: %s [nm_ip nm_port]\n", argv[0]);
+        return 1;
+    }
+
     char client_id[ID_MAX] = {0 };
 
     printf("[Client] Enter your unique client id (username): ");
@@ -277,7 +286,7 @@ int main(void) {
 
     // Optional: introduce client to NM (so NM can maintain USER_LIST even before first command).
     {
-        int fd = connect_addr(NM_IP, NM_PORT);
+        int fd = connect_addr(g_nm_ip, g_nm_port);
         if (fd >= 0) {
             log_message("INFO", "Introducing client %s to Name Server", client_id);
             dprintf(fd, "HELLOCLIENT %s\n", client_id);
@@ -333,7 +342,7 @@ int main(void) {
             strcasecmp(verb_token, "VIEWCHECKPOINT") == 0 ||
             strcasecmp(verb_token, "REVERT") == 0 ||
             strcasecmp(verb_token, "LISTCHECKPOINTS") == 0) {
-            int nmfd = connect_addr(NM_IP, NM_PORT);
+            int nmfd = connect_addr(g_nm_ip, g_nm_port);
             if (nmfd < 0) { continue; }
             dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
             read_all_and_print(nmfd);
@@ -341,7 +350,7 @@ int main(void) {
             continue;
         }
 
-        int nmfd = connect_addr(NM_IP, NM_PORT);
+        int nmfd = connect_addr(g_nm_ip, g_nm_port);
         if (nmfd < 0) { continue; }
         dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
         read_all_and_print(nmfd);

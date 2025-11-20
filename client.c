@@ -37,7 +37,7 @@
 #define FNAME_MAX 256
 #define IP_MAX    64
 
-static char g_nm_ip[64] = "127.0.0.1";
+static char g_nm_ip[64] = "0.0.0.0";
 static int g_nm_port = 5000;
 
 // --- helpers ---

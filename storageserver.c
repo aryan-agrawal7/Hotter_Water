@@ -25,7 +25,7 @@
 #define ID_MAX  64
 #define FNAME_MAX 256
 
-static char g_nm_ip[64] = "127.0.0.1";
+static char g_nm_ip[64] = "0.0.0.0";
 static int g_nm_port = 5000;
 
 static void log_message(const char *level, const char *fmt, ...) {

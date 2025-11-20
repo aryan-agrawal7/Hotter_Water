@@ -947,6 +947,16 @@ static void send_sentence_snapshot(int cfd, const SentenceNode *sentence) {
     free(joined);
 }
 
+// Check if a sentence ends with a delimiter
+static bool sentence_ends_with_delimiter(const SentenceNode *s) {
+    if (!s || !s->words_tail) return false;
+    const char *last_word = s->words_tail->data;
+    if (!last_word || *last_word == '\0') return false;
+    size_t len = strlen(last_word);
+    char last_char = last_word[len - 1];
+    return is_sentence_delimiter(last_char);
+}
+
 static void handle_write_begin(int cfd, const char *ss_id, const char *client_id, const char *arg);
 static void handle_write_update(int cfd, const char *ss_id, const char *client_id, const char *index_token, const char *arg);
 static void handle_write_commit(int cfd, const char *ss_id, const char *client_id);
@@ -1070,6 +1080,12 @@ static void handle_write_begin(int cfd, const char *ss_id, const char *client_id
 
     if (!target) {
         if (idx == sentence_index) {
+            // Check if we can append a new sentence
+            // We can only append (access n+1) if the last sentence ends with a delimiter
+            if (doc->tail && !sentence_ends_with_delimiter(doc->tail)) {
+                dprintf(cfd, "ERR WRITE sentence_out_of_range\n");
+                return;
+            }
             // Append new sentence (blank line)
             target = sentence_new();
             document_append_sentence(doc, target);

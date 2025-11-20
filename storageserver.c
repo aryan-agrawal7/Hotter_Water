@@ -1058,18 +1058,18 @@ static void sentence_normalize(Document *doc, SentenceNode *s) {
 }
 
 static void handle_write_begin(int cfd, const char *ss_id, const char *client_id, const char *arg) {
-    if (!arg || *arg == '\0') { dprintf(cfd, "ERR WRITE missing_arguments\n"); return; }
+    if (!arg || *arg == '\0') { dprintf(cfd, "ERR WRITE missing_arguments\n"); send_stop_packet(cfd, "WRITE", "-"); return; }
 
     char filename[ID_MAX];
     int sentence_index = 0;
-    if (sscanf(arg, "%63s %d", filename, &sentence_index) != 2) { dprintf(cfd, "ERR WRITE bad_arguments\n"); return; }
-    if (!is_valid_name_component(filename)) { dprintf(cfd, "ERR WRITE invalid_filename\n"); return; }
-    if (sentence_index <= 0) { dprintf(cfd, "ERR WRITE bad_sentence_index\n"); return; }
+    if (sscanf(arg, "%63s %d", filename, &sentence_index) != 2) { dprintf(cfd, "ERR WRITE bad_arguments\n"); send_stop_packet(cfd, "WRITE", "-"); return; }
+    if (!is_valid_name_component(filename)) { dprintf(cfd, "ERR WRITE invalid_filename\n"); send_stop_packet(cfd, "WRITE", filename); return; }
+    if (sentence_index <= 0) { dprintf(cfd, "ERR WRITE bad_sentence_index\n"); send_stop_packet(cfd, "WRITE", filename); return; }
 
-    if (session_find_by_client(client_id)) { dprintf(cfd, "ERR WRITE already_in_progress\n"); return; }
+    if (session_find_by_client(client_id)) { dprintf(cfd, "ERR WRITE already_in_progress\n"); send_stop_packet(cfd, "WRITE", filename); return; }
 
     Document *doc = get_document(filename);
-    if (!doc) { dprintf(cfd, "ERR WRITE load_failed\n"); return; }
+    if (!doc) { dprintf(cfd, "ERR WRITE load_failed\n"); send_stop_packet(cfd, "WRITE", filename); return; }
 
     SentenceNode *target = doc->head;
     int idx = 1;
@@ -1084,6 +1084,7 @@ static void handle_write_begin(int cfd, const char *ss_id, const char *client_id
             // We can only append (access n+1) if the last sentence ends with a delimiter
             if (doc->tail && !sentence_ends_with_delimiter(doc->tail)) {
                 dprintf(cfd, "ERR WRITE sentence_out_of_range\n");
+                send_stop_packet(cfd, "WRITE", filename);
                 return;
             }
             // Append new sentence (blank line)
@@ -1091,6 +1092,7 @@ static void handle_write_begin(int cfd, const char *ss_id, const char *client_id
             document_append_sentence(doc, target);
         } else {
             dprintf(cfd, "ERR WRITE sentence_out_of_range\n");
+            send_stop_packet(cfd, "WRITE", filename);
             return;
         }
     }
@@ -1098,12 +1100,13 @@ static void handle_write_begin(int cfd, const char *ss_id, const char *client_id
     if (target->locked) {
         if (strcmp(target->locked_by, client_id) != 0) {
             dprintf(cfd, "ERR WRITE locked %s %d\n", filename, sentence_index);
+            send_stop_packet(cfd, "WRITE", filename);
             return;
         }
     }
 
     WriteSession *session = session_allocate();
-    if (!session) { dprintf(cfd, "ERR WRITE too_many_sessions\n"); return; }
+    if (!session) { dprintf(cfd, "ERR WRITE too_many_sessions\n"); send_stop_packet(cfd, "WRITE", filename); return; }
 
     target->locked = true;
     strncpy(target->locked_by, client_id, ID_MAX-1);
@@ -1149,24 +1152,31 @@ static void handle_write_update(int cfd, const char *ss_id, const char *client_i
     
     if (!w) {
         if (current_idx == word_index) {
-            // Append word
+            // Append word at the end
             sentence_append_word(s, arg);
-            w = s->words_tail;
         } else {
             dprintf(cfd, "ERR WRITE index_out_of_bounds\n");
             return;
         }
     } else {
-        // Append to existing word instead of replacing
-        size_t old_len = strlen(w->data);
-        size_t arg_len = strlen(arg);
-        char *new_data = malloc(old_len + arg_len + 1);
-        if (new_data) {
-            strcpy(new_data, w->data);
-            strcat(new_data, arg);
-            free(w->data);
-            w->data = new_data;
+        // Insert new word BEFORE the word at word_index
+        WordNode *new_word = word_new(arg);
+        if (!new_word) {
+            dprintf(cfd, "ERR WRITE allocation_failed\n");
+            return;
         }
+        
+        // Insert new_word before w
+        new_word->next = w;
+        new_word->prev = w->prev;
+        
+        if (w->prev) {
+            w->prev->next = new_word;
+        } else {
+            // w was the head, so new_word becomes the new head
+            s->words_head = new_word;
+        }
+        w->prev = new_word;
     }
     
     // Normalize sentence (handle splitting)

@@ -145,6 +145,27 @@ static bool send_command_to_ss(const DirectEndpoint *ep, const char *client_id, 
     return true;
 }
 
+static bool send_command_to_ss_with_response(const DirectEndpoint *ep, const char *client_id, const char *payload, char *first_line, size_t first_line_sz) {
+    int ssfd = connect_addr(ep->ip, ep->port);
+    if (ssfd < 0) {
+        fprintf(stderr, "[Client] unable to connect to storage server %s (%s:%d)\n",
+                ep->ss_id, ep->ip, ep->port);
+        return false;
+    }
+    if (dprintf(ssfd, "HELLO %s %s\n", client_id, payload) < 0) {
+        perror("send");
+        close(ssfd);
+        return false;
+    }
+    ssize_t n = read_line(ssfd, first_line, first_line_sz);
+    if (n > 0 && first_line[0] != '\0') {
+        printf("%s\n", first_line);
+    }
+    read_all_and_print(ssfd);
+    close(ssfd);
+    return (n > 0);
+}
+
 static void handle_direct_read(const char *client_id, const char *cmdline) {
     DirectEndpoint ep;
     if (!request_direct_endpoint(client_id, cmdline, &ep)) return;
@@ -172,7 +193,14 @@ static void handle_direct_write(const char *client_id, const char *cmdline) {
 
     char header[LINE_MAX];
     snprintf(header, sizeof(header), "WRITE %s %s", ep.filename, ep.extra);
-    if (!send_command_to_ss(&ep, client_id, header)) {
+    char response[LINE_MAX];
+    if (!send_command_to_ss_with_response(&ep, client_id, header, response, sizeof(response))) {
+        return;
+    }
+
+    // Check if the initial WRITE command failed
+    if (strncmp(response, "ERR", 3) == 0 || strncmp(response, "STOP", 4) == 0) {
+        // Error already printed by send_command_to_ss_with_response
         return;
     }
 
@@ -192,7 +220,14 @@ static void handle_direct_write(const char *client_id, const char *cmdline) {
             send_command_to_ss(&ep, client_id, "ETIRW");
             break;
         }
-        send_command_to_ss(&ep, client_id, line);
+        
+        char update_response[LINE_MAX];
+        if (send_command_to_ss_with_response(&ep, client_id, line, update_response, sizeof(update_response))) {
+            // Check for STOP packet indicating error or completion
+            if (strncmp(update_response, "STOP", 4) == 0) {
+                break;
+            }
+        }
     }
 }
 

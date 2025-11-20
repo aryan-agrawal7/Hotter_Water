@@ -486,8 +486,13 @@ static bool is_sentence_delimiter(char c) {
     return c == '.' || c == '!' || c == '?' || c == '\n';
 }
 
-static int document_parse_from_path(const char *path, Document *doc, mode_t *mode_out) {
-    document_init(doc, path);
+
+static int document_load_from_file(const char *filename, Document *doc, mode_t *mode_out) {
+    // Initialize with the LOGICAL filename (not the on-disk path) so in-memory cache matches future lookups.
+    document_init(doc, filename);
+
+    char path[PATH_MAX];
+    if (storage_path_for(filename, path, sizeof(path)) < 0) return -1;
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
@@ -524,8 +529,6 @@ static int document_parse_from_path(const char *path, Document *doc, mode_t *mod
         bool is_space = isspace((unsigned char)c) && !is_newline;
 
         if (is_punct) {
-            // Punctuation is a delimiter.
-            // Add preceding word if any.
             if (word_start != (size_t)-1) {
                 size_t len = i - word_start;
                 char *w = malloc(len + 2);
@@ -536,19 +539,16 @@ static int document_parse_from_path(const char *path, Document *doc, mode_t *mod
                 free(w);
                 word_start = (size_t)-1;
             } else {
-                // Punctuation standing alone (or after space)
                 char w[2] = {c, '\0'};
                 if (!current) { current = sentence_new(); document_append_sentence(doc, current); }
                 sentence_append_word(current, w);
             }
             current = NULL; // End sentence
-            skip_newline = true; // Expect a newline to follow, which we should ignore as it's just formatting
+            skip_newline = true;
         } else if (is_newline) {
             if (skip_newline) {
                 skip_newline = false;
-                // Ignore this newline
             } else {
-                // Newline is a delimiter here (e.g. Title\n or blank line)
                 if (word_start != (size_t)-1) {
                     size_t len = i - word_start;
                     char *w = strndup(buffer + word_start, len);
@@ -557,9 +557,6 @@ static int document_parse_from_path(const char *path, Document *doc, mode_t *mod
                     free(w);
                     word_start = (size_t)-1;
                 } else {
-                    // No pending word.
-                    // If current is NULL, it means we are between sentences.
-                    // This newline creates an empty sentence (blank line).
                     if (!current) {
                         current = sentence_new();
                         document_append_sentence(doc, current);
@@ -577,9 +574,7 @@ static int document_parse_from_path(const char *path, Document *doc, mode_t *mod
                 free(w);
                 word_start = (size_t)-1;
             }
-            // Space does NOT reset skip_newline
         } else {
-            // Normal char
             if (word_start == (size_t)-1) word_start = i;
             skip_newline = false;
         }
@@ -587,6 +582,7 @@ static int document_parse_from_path(const char *path, Document *doc, mode_t *mod
     free(buffer);
     return 0;
 }
+
 
 static char *sentence_join_words(const SentenceNode *s) {
     if (!s || !s->words_head) return strdup("");
@@ -1197,6 +1193,8 @@ static void handle_write_commit(int cfd, const char *ss_id, const char *client_i
     write_info_txt(session->filename, owner[0]?owner:NULL, access_str, created[0]?created:NULL, now, now, client_id);
 
     dprintf(cfd, "ACK %s WRITE COMMIT %s\n", ss_id, session->filename);
+    // Send STOP so the client knows the WRITE session is complete
+    send_stop_packet(cfd, "WRITE", session->filename);
     session_release(session);
 }
 
@@ -1250,9 +1248,7 @@ static Document *get_document(const char *filename) {
         if (!g_docs[i]) {
             Document *doc = malloc(sizeof(Document));
             if (!doc) return NULL;
-            char path[PATH_MAX];
-            if (storage_path_for(filename, path, sizeof(path)) < 0) { free(doc); return NULL; }
-            if (document_parse_from_path(path, doc, NULL) < 0) { free(doc); return NULL; }
+            if (document_load_from_file(filename, doc, NULL) < 0) { free(doc); return NULL; }
             g_docs[i] = doc;
             return doc;
         }

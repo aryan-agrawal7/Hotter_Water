@@ -19,10 +19,25 @@
 #include <unistd.h>
 #include <time.h>
 #include <signal.h>
+#include <stdarg.h>
 
 #define NM_IP   "127.0.0.1"
 #define NM_PORT 5000
 #define ID_MAX  64
+
+static void log_message(const char *level, const char *fmt, ...) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
+
+    fprintf(stderr, "[%s] [%s] ", time_str, level);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
 
 static char g_storage_dir[PATH_MAX];
 
@@ -34,29 +49,41 @@ static int swap_path_for(const char *name, char *out, size_t out_sz);
 
 static int create_listen_socket(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { perror("Socket Error in function ss.create_listen_socket()"); exit(1); }
+    if (fd < 0) { 
+        log_message("ERROR", "Socket Error in function ss.create_listen_socket(): %s", strerror(errno)); 
+        exit(1); 
+    }
     int opt = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(port);
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind error in function ss.create_listen_socket()"); exit(1);
+        log_message("ERROR", "bind error in function ss.create_listen_socket(): %s", strerror(errno)); 
+        exit(1);
     }
-    if (listen(fd, 128) < 0) { perror("listen error in function ss.create_listen_socket()"); exit(1); }
+    if (listen(fd, 128) < 0) { 
+        log_message("ERROR", "listen error in function ss.create_listen_socket(): %s", strerror(errno)); 
+        exit(1); 
+    }
     return fd;
 }
 
 static int connect_to_nm(const char *ip, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket error in function ss.connect_to_nm() "); exit(1); }
+    if (fd < 0) { 
+        log_message("ERROR", "socket error in function ss.connect_to_nm(): %s", strerror(errno)); 
+        exit(1); 
+    }
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_port = htons(port);
     if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
-        fprintf(stderr, "Named Server IP is invalid\n"); exit(1);
+        log_message("ERROR", "Named Server IP is invalid"); 
+        exit(1);
     }
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect NM error in function ss.connect_to_nm()"); exit(1);
+        log_message("ERROR", "connect NM error in function ss.connect_to_nm(): %s", strerror(errno)); 
+        exit(1);
     }
     return fd;
 }
@@ -1068,6 +1095,8 @@ static void handle_write_begin(int cfd, const char *ss_id, const char *client_id
 
     if (session_find_by_client(client_id)) { dprintf(cfd, "ERR WRITE already_in_progress\n"); send_stop_packet(cfd, "WRITE", filename); return; }
 
+    log_message("INFO", "Client %s starting WRITE session on %s (sentence %d)", client_id, filename, sentence_index);
+
     Document *doc = get_document(filename);
     if (!doc) { dprintf(cfd, "ERR WRITE load_failed\n"); send_stop_packet(cfd, "WRITE", filename); return; }
 
@@ -1126,18 +1155,40 @@ static void handle_write_begin(int cfd, const char *ss_id, const char *client_id
 }
 
 static void handle_write_update(int cfd, const char *ss_id, const char *client_id, const char *index_token, const char *arg) {
-    if (!index_token || !is_number_string(index_token)) { dprintf(cfd, "ERR WRITE bad_word_index\n"); return; }
-    if (!arg || *arg == '\0') { dprintf(cfd, "ERR WRITE missing_content\n"); return; }
+    if (!index_token || !is_number_string(index_token)) { 
+        log_message("WARN", "Client %s sent bad word index: %s", client_id, index_token ? index_token : "(null)");
+        dprintf(cfd, "ERR WRITE bad_word_index\n"); 
+        return; 
+    }
+    if (!arg || *arg == '\0') { 
+        log_message("WARN", "Client %s sent missing content for WRITE", client_id);
+        dprintf(cfd, "ERR WRITE missing_content\n"); 
+        return; 
+    }
 
     long idx_long = strtol(index_token, NULL, 10);
-    if (idx_long <= 0) { dprintf(cfd, "ERR WRITE bad_word_index\n"); return; }
+    if (idx_long <= 0) { 
+        log_message("WARN", "Client %s sent invalid word index: %ld", client_id, idx_long);
+        dprintf(cfd, "ERR WRITE bad_word_index\n"); 
+        return; 
+    }
     int word_index = (int)idx_long;
 
+    // log_message("DEBUG", "Client %s WRITE update %s word %d: %s", client_id, session->filename, word_index, arg);
+
     WriteSession *session = session_find_by_client(client_id);
-    if (!session) { dprintf(cfd, "ERR WRITE no_active_session\n"); return; }
+    if (!session) { 
+        log_message("WARN", "Client %s attempted WRITE update without active session", client_id);
+        dprintf(cfd, "ERR WRITE no_active_session\n"); 
+        return; 
+    }
 
     SentenceNode *s = session->target;
-    if (!s) { dprintf(cfd, "ERR WRITE invalid_session_state\n"); return; }
+    if (!s) { 
+        log_message("ERROR", "Client %s session has invalid state (no target)", client_id);
+        dprintf(cfd, "ERR WRITE invalid_session_state\n"); 
+        return; 
+    }
 
     int current_idx = 1;
     WordNode *w = s->words_head;
@@ -1154,7 +1205,9 @@ static void handle_write_update(int cfd, const char *ss_id, const char *client_i
         if (current_idx == word_index) {
             // Append word at the end
             sentence_append_word(s, arg);
+            log_message("INFO", "Client %s appended word '%s' at index %d", client_id, arg, word_index);
         } else {
+            log_message("WARN", "Client %s index out of bounds: %d (max %d)", client_id, word_index, current_idx);
             dprintf(cfd, "ERR WRITE index_out_of_bounds\n");
             return;
         }
@@ -1162,6 +1215,7 @@ static void handle_write_update(int cfd, const char *ss_id, const char *client_i
         // Insert new word BEFORE the word at word_index
         WordNode *new_word = word_new(arg);
         if (!new_word) {
+            log_message("ERROR", "Allocation failed for new word");
             dprintf(cfd, "ERR WRITE allocation_failed\n");
             return;
         }
@@ -1177,6 +1231,7 @@ static void handle_write_update(int cfd, const char *ss_id, const char *client_i
             s->words_head = new_word;
         }
         w->prev = new_word;
+        log_message("INFO", "Client %s inserted word '%s' at index %d", client_id, arg, word_index);
     }
     
     // Normalize sentence (handle splitting)
@@ -1189,6 +1244,8 @@ static void handle_write_update(int cfd, const char *ss_id, const char *client_i
 static void handle_write_commit(int cfd, const char *ss_id, const char *client_id) {
     WriteSession *session = session_find_by_client(client_id);
     if (!session) { dprintf(cfd, "ERR WRITE no_active_session\n"); return; }
+
+    log_message("INFO", "Client %s committing WRITE on %s", client_id, session->filename);
 
     Document *doc = session->doc;
     SentenceNode *target = session->target;
@@ -1229,6 +1286,8 @@ static void handle_undo(int cfd, const char *ss_id, const char *client_id, const
     if (!arg || sscanf(arg, "%63s", filename) != 1) { dprintf(cfd, "ERR UNDO missing_filename\n"); return; }
     if (!is_valid_name_component(filename)) { dprintf(cfd, "ERR UNDO invalid_filename\n"); return; }
     if (file_has_active_session(filename)) { dprintf(cfd, "ERR UNDO write_in_progress\n"); return; }
+
+    log_message("INFO", "Client %s requested UNDO on %s", client_id, filename);
 
     char current_path[PATH_MAX];
     if (storage_path_for(filename, current_path, sizeof(current_path)) < 0) { dprintf(cfd, "ERR UNDO %s\n", strerror(errno)); return; }
@@ -1303,6 +1362,7 @@ int main(void) {
     if (scanf("%63s", ss_id) != 1) { fprintf(stderr, "bad id\n"); return 1; }
 
     if (ensure_storage_directory(ss_id) != 0) {
+        log_message("ERROR", "storage directory doesnot exist in function ss.main");
         perror("storage directory doesnot exist in function ss.main");
         return 1;
     }
@@ -1315,14 +1375,13 @@ int main(void) {
     int ch; while ((ch = getchar()) != '\n' && ch != EOF) {}
 
     int listen_fd = create_listen_socket(client_port);
-    printf("[Storage Server %s] is now listening for clients on port %d\n", ss_id, client_port);
-    fflush(stdout);
+    log_message("INFO", "[Storage Server %s] is now listening for clients on port %d", ss_id, client_port);
 
     // Register with Name Server
     int nmfd = connect_to_nm(NM_IP, NM_PORT);
     dprintf(nmfd, "REGISTER %s %d\n", ss_id, client_port);
     char resp[LINE_MAX]; read_line(nmfd, resp, sizeof(resp));
-    printf("[SS %s] Named Server response: %s\n", ss_id, resp);
+    log_message("INFO", "[SS %s] Named Server response: %s", ss_id, resp);
     close(nmfd);
 
     // Accept clients and print debug on connect
@@ -1331,7 +1390,7 @@ int main(void) {
         int cfd = accept(listen_fd, (struct sockaddr*)&cli, &clilen);
         if (cfd < 0) {
             if (errno == EINTR) continue;
-            perror("accept function error in function ss.main"); continue;
+            log_message("ERROR", "accept function error in function ss.main: %s", strerror(errno)); continue;
         }
         char line[LINE_MAX];
         ssize_t n = read_line(cfd, line, sizeof(line));
@@ -1340,8 +1399,7 @@ int main(void) {
             char client_id[ID_MAX] = {0};
             char cmd[LINE_MAX] = {0};
             if (sscanf(line, "HELLO %63s %2047[^\n]", client_id, cmd) >= 1) {
-                printf("Storage Server %s connected to Client %s\n", ss_id, client_id);
-                fflush(stdout);
+                log_message("INFO", "Storage Server %s connected to Client %s", ss_id, client_id);
                 char command_copy[LINE_MAX];
                 strncpy(command_copy, cmd, sizeof(command_copy) - 1);
                 command_copy[sizeof(command_copy) - 1] = '\0';
@@ -1394,14 +1452,12 @@ int main(void) {
                                                    lastmod,
                                                    created,
                                                    (got==2)?owner_token:NULL);
-                                    printf("[SS %s] Successful Create -> file %s | Owner -> %s\n", ss_id, fname, client_id);
-                                    fflush(stdout);
+                                    log_message("INFO", "[SS %s] Successful Create -> file %s | Owner -> %s", ss_id, fname, client_id);
                                     dprintf(cfd, "ACK %s CREATE OK %s\n", ss_id, fname);
                                 } else {
                                     int err = errno;
-                                    fprintf(stderr, "[SS %s] Create file failed | %s not created | client %s: %s\n",
+                                    log_message("ERROR", "[SS %s] Create file failed | %s not created | client %s: %s",
                                             ss_id, fname, client_id, strerror(err));
-                                    fflush(stderr);
                                     if (err == EEXIST) {
                                         dprintf(cfd, "ERR CREATE EXISTS %s\n", fname);
                                     } else {
@@ -1417,14 +1473,12 @@ int main(void) {
                             dprintf(cfd, "ERR DELETE invalid_filename\n");
                         } else {
                             if (delete_storage_file(arg) == 0) {
-                                printf("[SS %s] Successfully deleted file %s by Client %s\n", ss_id, arg, client_id);
-                                fflush(stdout);
+                                log_message("INFO", "[SS %s] Successfully deleted file %s by Client %s", ss_id, arg, client_id);
                                 dprintf(cfd, "ACK %s DELETE OK %s\n", ss_id, arg);
                             } else {
                                 int err = errno;
-                                fprintf(stderr, "[SS %s] failed to delete file %s for client %s: %s\n",
+                                log_message("ERROR", "[SS %s] failed to delete file %s for client %s: %s",
                                         ss_id, arg, client_id, strerror(err));
-                                fflush(stderr);
                                 if (err == ENOENT) {
                                     dprintf(cfd, "ERR DELETE NOTFOUND %s\n", arg);
                                 } else {
@@ -1442,9 +1496,8 @@ int main(void) {
                             int fd = open_storage_file_ro(arg);
                             if (fd < 0) {
                                 int err = errno;
-                                fprintf(stderr, "[SS %s] failed to open file %s for client %s: %s\n",
+                                log_message("ERROR", "[SS %s] failed to open file %s for client %s: %s",
                                         ss_id, arg, client_id, strerror(err));
-                                fflush(stderr);
                                 if (err == ENOENT) {
                                     dprintf(cfd, "ERR READ NOTFOUND %s\n", arg);
                                 } else {
@@ -1465,24 +1518,21 @@ int main(void) {
                                     if (send_all(cfd, buffer, (size_t)rbytes) < 0) {
                                         send_failed = 1;
                                         int err = errno;
-                                        fprintf(stderr, "[SS %s] send failure while streaming %s to client %s: %s\n",
+                                        log_message("ERROR", "[SS %s] send failure while streaming %s to client %s: %s",
                                                 ss_id, arg, client_id, strerror(err));
-                                        fflush(stderr);
                                         break;
                                     }
                                 }
                                 if (rbytes < 0) {
                                     int err = errno;
-                                    fprintf(stderr, "[SS %s] read failure while streaming %s to client %s: %s\n",
+                                    log_message("ERROR", "[SS %s] read failure while streaming %s to client %s: %s",
                                             ss_id, arg, client_id, strerror(err));
-                                    fflush(stderr);
                                     if (!send_failed) {
                                         dprintf(cfd, "\nERR READ IO %s\n", strerror(err));
                                     }
                                 } else if (!send_failed) {
                                     dprintf(cfd, "\nENDDATA %s READ %s\n", ss_id, arg);
-                                    printf("[SS %s] Successful Streaming of file %s to client %s\n", ss_id, arg, client_id);
-                                    fflush(stdout);
+                                    log_message("INFO", "[SS %s] Successful Streaming of file %s to client %s", ss_id, arg, client_id);
                                     // update info.txt last accessed
                                     char owner[ID_MAX]={0}, access_str[256]={0}, created[64]={0}, lastmod[64]={0};
                                     char last_access_ts[64]={0}, last_access_user[ID_MAX]={0};
@@ -1521,8 +1571,7 @@ int main(void) {
                                 if (!f) {
                                     dprintf(cfd, "ERR STREAM %s\n", strerror(errno));
                                 } else {
-                                    printf("[SS %s] Starting streaming file %s to client %s\n", ss_id, arg, client_id);
-                                    fflush(stdout);
+                                    log_message("INFO", "[SS %s] Starting streaming file %s to client %s", ss_id, arg, client_id);
                                     char word[1024];
                                     bool send_error = false;
                                     while (fscanf(f, "%1023s", word) == 1) {
@@ -1530,9 +1579,8 @@ int main(void) {
                                         if (send_all(cfd, word, len) < 0 || send_all(cfd, " ", 1) < 0) {
                                             send_error = true;
                                             int err = errno;
-                                            fprintf(stderr, "[SS %s] client %s disconnected mid-stream for %s: %s\n",
+                                            log_message("ERROR", "[SS %s] client %s disconnected mid-stream for %s: %s",
                                                     ss_id, client_id, arg, strerror(err));
-                                            fflush(stderr);
                                             break;
                                         }
                                         usleep(100000);
@@ -1571,9 +1619,8 @@ int main(void) {
                             int fd = open_storage_file_ro(arg);
                             if (fd < 0) {
                                 int err = errno;
-                                fprintf(stderr, "[SS %s] failed to open file %s for EXEC by %s: %s\n",
+                                log_message("ERROR", "[SS %s] failed to open file %s for EXEC by %s: %s",
                                         ss_id, arg, client_id, strerror(err));
-                                fflush(stderr);
                                 if (err == ENOENT) dprintf(cfd, "ERR EXEC NOTFOUND %s\n", arg);
                                 else dprintf(cfd, "ERR EXEC %s\n", strerror(err));
                             } else {
@@ -1589,7 +1636,7 @@ int main(void) {
                                     int err = errno; if (!send_failed) dprintf(cfd, "\nERR EXEC IO %s\n", strerror(err));
                                 } else if (!send_failed) {
                                     dprintf(cfd, "\nENDDATA %s EXEC %s\n", ss_id, arg);
-                                    printf("[SS %s] Successfully sent EXEC payload %s to %s\n", ss_id, arg, client_id); fflush(stdout);
+                                    log_message("INFO", "[SS %s] Successfully sent EXEC payload %s to %s", ss_id, arg, client_id);
                                 }
                                 close(fd);
                                 // update last access

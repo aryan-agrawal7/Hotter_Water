@@ -29,6 +29,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <time.h>
+#include <stdarg.h>
 
 #define NM_IP    "127.0.0.1"
 #define NM_PORT  5000
@@ -38,17 +40,37 @@
 #define IP_MAX    64
 
 // --- helpers ---
+static void log_message(const char *level, const char *fmt, ...) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
+
+    fprintf(stderr, "[%s] [%s] ", time_str, level);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
 static int connect_addr(const char *ip, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) { perror("socket"); return -1; }
+    if (fd < 0) { 
+        log_message("ERROR", "socket creation failed: %s", strerror(errno)); 
+        return -1; 
+    }
     struct sockaddr_in addr; memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET; addr.sin_port = htons(port);
     if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
-        fprintf(stderr, "invalid ip: %s\n", ip); close(fd); return -1;
+        log_message("ERROR", "invalid ip: %s", ip); 
+        close(fd); return -1;
     }
     if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect"); close(fd); return -1;
+        log_message("ERROR", "connect to %s:%d failed: %s", ip, port, strerror(errno));
+        close(fd); return -1;
     }
+    // log_message("DEBUG", "Connected to %s:%d", ip, port);
     return fd;
 }
 
@@ -80,7 +102,7 @@ static void read_all_and_print(int fd) {
         ended_with_newline = (buf[n-1] == '\n');
     }
     if (n < 0) {
-        fprintf(stderr, "[Client] connection lost while receiving data: %s\n", strerror(errno));
+        log_message("ERROR", "connection lost while receiving data: %s", strerror(errno));
     }
     if (printed_any && !ended_with_newline) {
         printf("\n");
@@ -98,13 +120,14 @@ typedef struct {
 } DirectEndpoint;
 
 static bool request_direct_endpoint(const char *client_id, const char *cmdline, DirectEndpoint *out) {
+    log_message("INFO", "Client %s requesting direct endpoint for command: %s", client_id, cmdline);
     int nmfd = connect_addr(NM_IP, NM_PORT);
     if (nmfd < 0) return false;
     dprintf(nmfd, "CLIENT %s %s\n", client_id, cmdline);
     char first_line[LINE_MAX];
     ssize_t got = read_line(nmfd, first_line, sizeof(first_line));
     if (got <= 0) {
-        printf("ERROR no response from Name Server\n");
+        log_message("ERROR", "no response from Name Server");
         close(nmfd);
         return false;
     }
@@ -119,24 +142,25 @@ static bool request_direct_endpoint(const char *client_id, const char *cmdline, 
     DirectEndpoint tmp;
     if (sscanf(first_line, "DIRECT %15s %255s %63s %63s %63s %d",
                tmp.verb, tmp.filename, tmp.extra, tmp.ss_id, tmp.ip, &tmp.port) != 6) {
-        printf("ERROR malformed DIRECT response: %s\n", first_line);
+        log_message("ERROR", "malformed DIRECT response: %s", first_line);
         close(nmfd);
         return false;
     }
+    log_message("INFO", "Received endpoint: SSID=%s IP=%s Port=%d for %s %s", tmp.ss_id, tmp.ip, tmp.port, tmp.verb, tmp.filename);
     *out = tmp;
     close(nmfd);
     return true;
 }
 
 static bool send_command_to_ss(const DirectEndpoint *ep, const char *client_id, const char *payload) {
+    log_message("INFO", "Connecting to Storage Server %s (%s:%d)", ep->ss_id, ep->ip, ep->port);
     int ssfd = connect_addr(ep->ip, ep->port);
     if (ssfd < 0) {
-        fprintf(stderr, "[Client] unable to connect to storage server %s (%s:%d)\n",
-                ep->ss_id, ep->ip, ep->port);
+        log_message("ERROR", "unable to connect to storage server %s (%s:%d)", ep->ss_id, ep->ip, ep->port);
         return false;
     }
     if (dprintf(ssfd, "HELLO %s %s\n", client_id, payload) < 0) {
-        perror("send");
+        log_message("ERROR", "failed to send HELLO to SS: %s", strerror(errno));
         close(ssfd);
         return false;
     }
@@ -146,20 +170,24 @@ static bool send_command_to_ss(const DirectEndpoint *ep, const char *client_id, 
 }
 
 static bool send_command_to_ss_with_response(const DirectEndpoint *ep, const char *client_id, const char *payload, char *first_line, size_t first_line_sz) {
+    log_message("INFO", "Connecting to Storage Server %s (%s:%d) [Expect Response]", ep->ss_id, ep->ip, ep->port);
     int ssfd = connect_addr(ep->ip, ep->port);
     if (ssfd < 0) {
-        fprintf(stderr, "[Client] unable to connect to storage server %s (%s:%d)\n",
-                ep->ss_id, ep->ip, ep->port);
+        log_message("ERROR", "unable to connect to storage server %s (%s:%d)", ep->ss_id, ep->ip, ep->port);
         return false;
     }
     if (dprintf(ssfd, "HELLO %s %s\n", client_id, payload) < 0) {
-        perror("send");
+        log_message("ERROR", "failed to send HELLO to SS: %s", strerror(errno));
         close(ssfd);
         return false;
     }
     ssize_t n = read_line(ssfd, first_line, first_line_sz);
     if (n > 0 && first_line[0] != '\0') {
         printf("%s\n", first_line);
+        // Check for error in response
+        if (strncmp(first_line, "ERR", 3) == 0) {
+             log_message("ERROR", "Storage Server returned error: %s", first_line);
+        }
     }
     read_all_and_print(ssfd);
     close(ssfd);
@@ -187,6 +215,7 @@ static void handle_direct_write(const char *client_id, const char *cmdline) {
     DirectEndpoint ep;
     if (!request_direct_endpoint(client_id, cmdline, &ep)) return;
     if (strcmp(ep.extra, "-") == 0) {
+        log_message("ERROR", "WRITE missing sentence index");
         printf("ERROR WRITE missing sentence index\n");
         return;
     }
@@ -209,6 +238,7 @@ static void handle_direct_write(const char *client_id, const char *cmdline) {
     while (1) {
         printf("write> "); fflush(stdout);
         if (!fgets(line, sizeof(line), stdin)) {
+            log_message("INFO", "EOF during WRITE; sending ETIRW to release lock.");
             printf("\n[Client %s] EOF during WRITE; sending ETIRW to release lock.\n", client_id);
             send_command_to_ss(&ep, client_id, "ETIRW");
             break;
@@ -225,6 +255,7 @@ static void handle_direct_write(const char *client_id, const char *cmdline) {
         if (send_command_to_ss_with_response(&ep, client_id, line, update_response, sizeof(update_response))) {
             // Check for STOP packet indicating error or completion
             if (strncmp(update_response, "STOP", 4) == 0) {
+                log_message("INFO", "Received STOP from SS, ending write session.");
                 break;
             }
         }
@@ -233,11 +264,12 @@ static void handle_direct_write(const char *client_id, const char *cmdline) {
 
 // --- main ---
 int main(void) {
-    char client_id[ID_MAX] = {0};
+    char client_id[ID_MAX] = {0 };
 
     printf("[Client] Enter your unique client id (username): ");
     fflush(stdout);
     if (scanf("%63s", client_id) != 1) {
+        log_message("ERROR", "bad id input");
         fprintf(stderr, "bad id\n");
         return 1;
     }
@@ -247,6 +279,7 @@ int main(void) {
     {
         int fd = connect_addr(NM_IP, NM_PORT);
         if (fd >= 0) {
+            log_message("INFO", "Introducing client %s to Name Server", client_id);
             dprintf(fd, "HELLOCLIENT %s\n", client_id);
             // Don't block on replies; NM may or may not send one. If it does, print it.
             char tmp[LINE_MAX];
@@ -254,6 +287,8 @@ int main(void) {
                 if (tmp[0] != '\0') { printf("%s\n", tmp); }
             }
             close(fd);
+        } else {
+            log_message("WARN", "Could not connect to Name Server for introduction");
         }
     }
 

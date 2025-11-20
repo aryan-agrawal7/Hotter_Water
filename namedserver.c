@@ -43,6 +43,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <time.h>
 
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -54,6 +55,20 @@
 #define IP_MAX  INET_ADDRSTRLEN
 #define FNAME_MAX 256
 #define LINE_MAX 4096
+
+static void log_message(const char *level, const char *fmt, ...) {
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char time_str[64];
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", t);
+
+    fprintf(stderr, "[%s] [%s] ", time_str, level);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
 
 #define FILE_INITIAL_CAPACITY 256
 #define FILE_MAP_INIT_CAP (FILE_INITIAL_CAPACITY*2)
@@ -496,14 +511,13 @@ static void register_ss(const char *id, int client_port, const char *peer_ip) {
         g_ss[idx].client_port = client_port;
         if(g_ss[idx].heap_index==-1) heap_insert(idx);
         pthread_mutex_unlock(&g_mtx);
-        printf("[NM] Storage server registered SSid: %s at port %s:%d (no_of_files=%d)\n",
+        log_message("INFO", "Storage server registered (UPDATE) SSid: %s at %s:%d (files=%d)",
                id, peer_ip, client_port, g_ss[idx].file_count);
-        fflush(stdout);
         return;
     }
     if (g_ss_count >= MAX_SS) {
         pthread_mutex_unlock(&g_mtx);
-        fprintf(stderr, "[NM] ERROR could not register SSid: %s as registry is full;\n", id);
+        log_message("ERROR", "could not register SSid: %s as registry is full", id);
         return;
     }
     SSInfo *s = &g_ss[g_ss_count];
@@ -517,9 +531,8 @@ static void register_ss(const char *id, int client_port, const char *peer_ip) {
     heap_insert(g_ss_count);
     g_ss_count++;
     pthread_mutex_unlock(&g_mtx);
-    printf("[NM] Storage server registered SSid: %s at port %s:%d (no_of_files=%d)\n",
+    log_message("INFO", "Storage server registered (NEW) SSid: %s at %s:%d (total_ss=%d)",
            id, peer_ip, client_port, g_ss_count);
-    fflush(stdout);
 }
 
 static int pick_least_loaded_ss() {
@@ -597,6 +610,7 @@ static void print_file_long(int fd, const FILE_META_DATA *m){
 
 // ----------------------- command handling -----------------------
 static void handle_view(int cfd, const char *client, const char *flag){
+    log_message("INFO", "Client %s requested VIEW %s", client, flag ? flag : "(default)");
     bool all = false;
     bool longlist = false;
 
@@ -634,6 +648,7 @@ static void handle_view(int cfd, const char *client, const char *flag){
 }
 
 static void handle_list_users(int cfd){
+    log_message("INFO", "Listing users");
     pthread_mutex_lock(&g_mtx);
     send_line(cfd, "USERS (%d):", USER_LIST.n);
     for(int i=0;i<USER_LIST.n;i++) send_line(cfd, "  %s", USER_LIST.v[i]);
@@ -641,17 +656,20 @@ static void handle_list_users(int cfd){
 }
 
 static void handle_create(int cfd, const char *client, const char *fname){
+    log_message("INFO", "Client %s requested CREATE %s", client, fname);
     if(!fname || !*fname){ send_line(cfd,"ERROR Create failed: Check File Name"); return; }
 
     pthread_mutex_lock(&g_mtx);
     if(fv_find(&ALL_FILES, fname)>=0){
         pthread_mutex_unlock(&g_mtx);
+        log_message("WARN", "CREATE failed: file %s already exists", fname);
         send_line(cfd, "ERROR Create failed as file already exists");
         return;
     }
     int sidx = heap_top();
     if(sidx<0){
         pthread_mutex_unlock(&g_mtx);
+        log_message("ERROR", "CREATE failed: no storage servers available");
         send_line(cfd, "ERROR Error no Storage server exists");
         return;
     }
@@ -673,6 +691,7 @@ static void handle_create(int cfd, const char *client, const char *fname){
     SSInfo ss = g_ss[sidx];
     pthread_mutex_unlock(&g_mtx);
 
+    log_message("INFO", "Creating file %s on SS %s (%s:%d)", fname, ss.id, ss.ip, ss.client_port);
     send_line(cfd, "Create successful CREATED %s on SSId: %s:%d (ss=%s)", fname, ss.ip, ss.client_port, ss.id);
 
     // notify SS (single line)
@@ -682,6 +701,7 @@ static void handle_create(int cfd, const char *client, const char *fname){
 }
 
 static void handle_addaccess(int cfd, const char *client, const char *flag, const char *fname, const char *user){
+    log_message("INFO", "Client %s requested ADDACCESS %s %s %s", client, flag, fname, user);
     if(!flag || !*flag || !fname || !*fname || !user || !*user){
         send_line(cfd, "ERROR BAD_ADDACCESS");
         return;
@@ -724,6 +744,7 @@ static void handle_addaccess(int cfd, const char *client, const char *flag, cons
 }
 
 static void handle_remaccess(int cfd, const char *client, const char *fname, const char *user){
+    log_message("INFO", "Client %s requested REMACCESS %s %s", client, fname, user);
     if(!fname || !user){ send_line(cfd,"ERROR BAD_REMACCESS"); return; }
     pthread_mutex_lock(&g_mtx);
     if(!sl_contains(&USER_LIST, user)){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR User Doesnt Exist"); return; }
@@ -746,6 +767,7 @@ static void handle_remaccess(int cfd, const char *client, const char *fname, con
 }
 
 static void handle_delete(int cfd, const char *client, const char *fname){
+    log_message("INFO", "Client %s requested DELETE %s", client, fname);
     // printf("Going to delete\n");
     pthread_mutex_lock(&g_mtx);
     int i = fv_find(&ALL_FILES, fname);
@@ -768,6 +790,7 @@ static void handle_delete(int cfd, const char *client, const char *fname){
     send_one_line_to_ss(m.ss_id, client, payload, cfd);
 }
 static void handle_read(int cfd, const char *client, const char *fname, const char *sentence_opt){
+    log_message("INFO", "Client %s requested READ %s (sent=%s)", client, fname, sentence_opt?sentence_opt:"-");
     if(!fname || !*fname){ send_line(cfd,"Read was unsuccessful"); return; }
 
     pthread_mutex_lock(&g_mtx);
@@ -799,6 +822,7 @@ static void handle_read(int cfd, const char *client, const char *fname, const ch
 }
 
 static void handle_stream_or_exec(int cfd, const char *client, const char *verb, const char *fname){
+    log_message("INFO", "Client %s requested %s %s", client, verb, fname);
     pthread_mutex_lock(&g_mtx);
     int i=fv_find(&ALL_FILES, fname);
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
@@ -820,6 +844,7 @@ static void handle_stream_or_exec(int cfd, const char *client, const char *verb,
 }
 
 static void handle_undo(int cfd, const char *client, const char *fname){
+    log_message("INFO", "Client %s requested UNDO %s", client, fname);
     pthread_mutex_lock(&g_mtx);
     int i=fv_find(&ALL_FILES, fname);
     if(i<0){ pthread_mutex_unlock(&g_mtx); send_line(cfd,"ERROR NO_SUCH_FILE"); return; }
@@ -836,6 +861,7 @@ static void handle_undo(int cfd, const char *client, const char *fname){
 }
 
 static void handle_write(int cfd, const char *client, const char *fname, const char *sent_str, int client_fd){
+    log_message("INFO", "Client %s requested WRITE %s (sent=%s)", client, fname, sent_str);
     (void)client_fd;
     if(!fname || !sent_str){ send_line(cfd,"ERROR BAD_WRITE"); return; }
     int sentence = atoi(sent_str);
@@ -868,6 +894,8 @@ static void *worker(void *arg_) {
     ssize_t n = read_line(fd, first, sizeof(first));
     if(n<=0){ close(fd); return NULL; }
 
+    // log_message("DEBUG", "Received: %s", first);
+
     if (strncmp(first, "REGISTER", 8) == 0) {
         char ss_id[ID_MAX]; int client_port=0;
         if (sscanf(first, "REGISTER %63s %d", ss_id, &client_port) == 2) {
@@ -875,6 +903,7 @@ static void *worker(void *arg_) {
             register_ss(ss_id, client_port, ip);
             send_line(fd, "OK");
         } else {
+            log_message("ERROR", "malformed REGISTER: %s", first);
             send_line(fd, "ERROR malformed REGISTER");
         }
         close(fd); return NULL;
@@ -883,6 +912,7 @@ static void *worker(void *arg_) {
     if (strncmp(first, "HELLOCLIENT", 11) == 0) {
         char client_id[ID_MAX]={0};
         if (sscanf(first, "HELLOCLIENT %63s", client_id) == 1) {
+            log_message("INFO", "Client introduced: %s", client_id);
             pthread_mutex_lock(&g_mtx); sl_add_unique(&USER_LIST, client_id); pthread_mutex_unlock(&g_mtx);
             send_line(fd, "OK HELLOCLIENT %s", client_id);
         } else send_line(fd, "ERROR malformed HELLOCLIENT");
@@ -1141,9 +1171,11 @@ static void *worker(void *arg_) {
             }
 
             // Unknown verb
+            log_message("WARN", "Unknown command from client %s: %s", client_id, verb);
             send_line(fd,"ERROR unknown command");
             close(fd); return NULL;
         } else {
+            log_message("ERROR", "malformed CLIENT command: %s", first);
             send_line(fd, "ERROR malformed CLIENT");
             close(fd); return NULL;
         }
@@ -1178,7 +1210,7 @@ int main(void) {
     file_cache_init(&FILE_CACHE);
 
     int listen_fd = create_listen_socket(NM_PORT);
-    printf("Named server has started on port %d\n", NM_PORT); fflush(stdout);
+    log_message("INFO", "Named server has started on port %d", NM_PORT);
 
     while (1) {
         struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
